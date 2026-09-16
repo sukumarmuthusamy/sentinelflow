@@ -55,6 +55,20 @@ class DeterministicEvaluationResult(BaseModel):
     gate: PolicyGateResult
 
 
+def resolve_fixture_directory(
+    change_id: str,
+    *,
+    pack_id: str,
+    domains_root: Path,
+) -> Path:
+    """Resolve a fixture directory from pack and change identifiers."""
+    fixture_dir = domains_root / pack_id / "fixtures" / "changes" / change_id
+    if not fixture_dir.is_dir() or not (fixture_dir / "manifest.yaml").is_file():
+        msg = f"Change fixture not found: {pack_id}/{change_id}"
+        raise FileNotFoundError(msg)
+    return fixture_dir
+
+
 def load_change_fixture_manifest(fixture_dir: Path) -> ChangeFixtureManifest:
     """Load and validate a fixture manifest.yaml."""
     manifest_path = fixture_dir / "manifest.yaml"

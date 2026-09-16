@@ -2,7 +2,7 @@
 
 ## Agentic Release Intelligence and Evidence-Grounded Quality Gate
 
-**Status:** canonical plan. This document supersedes [SentinelFlow_One_Week_Project_Plan.md](SentinelFlow_One_Week_Project_Plan.md) and [SentinelFlow_Multi_Agent_Architecture.md](SentinelFlow_Multi_Agent_Architecture.md). Where those two disagree, this document wins. [Top 3 Portfolio Projects.md](Top%203%20Portfolio%20Projects.md) remains background market research only.
+**Status:** canonical plan. This document supersedes [docs/planning-archive/SentinelFlow_One_Week_Project_Plan.md](docs/planning-archive/SentinelFlow_One_Week_Project_Plan.md) and [docs/planning-archive/SentinelFlow_Multi_Agent_Architecture.md](docs/planning-archive/SentinelFlow_Multi_Agent_Architecture.md). Where those two disagree, this document wins. [docs/planning-archive/Top 3 Portfolio Projects.md](docs/planning-archive/Top%203%20Portfolio%20Projects.md) remains background market research only.
 
 **Organizing principle:** milestones with exit criteria, not calendar weeks. A milestone is done when its gate passes, however long that takes.
 

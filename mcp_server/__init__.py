@@ -1,1 +1,1 @@
-"""sentinelflow-context MCP server (MCPServer SDK)."""
+"""MCP servers for SentinelFlow."""

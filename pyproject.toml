@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
     "grimp>=3.17",
+    "mcp[cli]==2.2.0",
     "networkx>=3.6",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.6.0",
@@ -22,6 +23,7 @@ dev = [
     "httpx>=0.28.0",
     "mypy>=1.14.0",
     "pre-commit>=4.0.0",
+    "pytest-asyncio>=0.25.0",
     "pytest>=8.3.0",
     "ruff>=0.8.0",
     "types-networkx>=3.2.1",
@@ -38,7 +40,7 @@ packages = ["app"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["app", "tests"]
+src = ["app", "mcp_server", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM"]
@@ -63,10 +65,16 @@ plugins = ["pydantic.mypy"]
 module = "tests.*"
 disallow_untyped_defs = false
 
+[[tool.mypy.overrides]]
+module = "mcp_server.*"
+disallow_untyped_defs = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.pydantic-mypy]
 init_forbid_extra = true

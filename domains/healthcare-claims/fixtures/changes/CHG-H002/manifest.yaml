@@ -4,6 +4,11 @@ category: api_contract
 primary_service: svc-core-api
 origin_nodes:
   - svc-core-api
+required_tests:
+  - test_claims_contract
+available_tests:
+  - test_claims_contract
+  - test_core_api_health
 contract_base: contracts/base/openapi.yaml
 contract_revision: contracts/revision/openapi.yaml
 expected_decision: BLOCK
