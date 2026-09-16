@@ -1,0 +1,15 @@
+{
+  "max_severity": "critical",
+  "verified_secret_exposure": true,
+  "findings": [
+    {
+      "id": "gitleaks-0",
+      "scanner": "gitleaks",
+      "severity": "critical",
+      "title": "generic-api-key",
+      "detail": "sk-live-example-token-for-fixture",
+      "file_path": "repo/config.py",
+      "rule_id": "generic-api-key"
+    }
+  ]
+}

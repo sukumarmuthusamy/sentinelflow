@@ -1,0 +1,22 @@
+openapi: 3.0.3
+info:
+  title: Payments API
+  version: 1.0.0
+paths:
+  /payments:
+    post:
+      operationId: createPayment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - amount_cents
+              properties:
+                amount_cents:
+                  type: integer
+      responses:
+        "201":
+          description: Created

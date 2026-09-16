@@ -1,0 +1,9 @@
+change_id: CHG-H002
+description: Breaking OpenAPI change on the critical core API service.
+category: api_contract
+primary_service: svc-core-api
+origin_nodes:
+  - svc-core-api
+contract_base: contracts/base/openapi.yaml
+contract_revision: contracts/revision/openapi.yaml
+expected_decision: BLOCK

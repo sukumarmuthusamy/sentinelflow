@@ -1,0 +1,8 @@
+change_id: CHG-H004
+description: Notification workflow change with evidence coverage below the pack floor.
+category: documentation
+primary_service: svc-notification
+origin_nodes:
+  - svc-notification
+evidence_coverage: 0.5
+expected_decision: REVIEW

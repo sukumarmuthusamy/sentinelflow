@@ -40,6 +40,41 @@ class ServiceDefinition(BaseModel):
     description: str | None = None
 
 
+class NonCodePathRules(BaseModel):
+    """Paths excluded from code-dependency graph traversal (domain-pack configurable)."""
+
+    extensions: list[str] = Field(
+        default_factory=lambda: [".md", ".txt", ".rst", ".adoc"],
+    )
+    path_segments: list[str] = Field(
+        default_factory=lambda: ["docs"],
+    )
+
+
+def is_non_code_path(path: str, rules: NonCodePathRules) -> bool:
+    """Return True when a file path should not enter the code dependency graph."""
+    normalized = path.replace("\\", "/").strip("/").lower()
+    if not normalized:
+        return False
+
+    for ext in rules.extensions:
+        suffix = ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+        if normalized.endswith(suffix):
+            return True
+
+    parts = normalized.split("/")
+    excluded_segments = {segment.lower() for segment in rules.path_segments}
+    return bool(excluded_segments.intersection(parts))
+
+
+def is_non_code_module(module_id: str, rules: NonCodePathRules) -> bool:
+    """Return True for module ids (file paths or dotted import names) that are non-code."""
+    path_like = module_id.replace(".", "/")
+    if is_non_code_path(path_like, rules):
+        return True
+    return is_non_code_path(f"{path_like}.py", rules)
+
+
 class DomainConfig(BaseModel):
     """Content of domain.yaml."""
 
@@ -48,6 +83,7 @@ class DomainConfig(BaseModel):
     description: str
     services: list[ServiceDefinition] = Field(min_length=1)
     data_classification_labels: list[str] = Field(min_length=1)
+    non_code_paths: NonCodePathRules = Field(default_factory=NonCodePathRules)
 
     @field_validator("pack_id")
     @classmethod
@@ -122,6 +158,7 @@ class PolicyConfig(BaseModel):
     """Content of policy.yaml."""
 
     evidence_floor: float = Field(ge=0.0, le=1.0)
+    dependency_vuln_ceiling: CriticalityTier = "high"
     decision_thresholds: DecisionThresholds
     risk_weights: RiskWeights
     overrides: list[PolicyOverride] = Field(default_factory=list)

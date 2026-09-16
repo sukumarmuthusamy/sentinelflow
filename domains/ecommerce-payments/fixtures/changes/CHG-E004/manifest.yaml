@@ -1,0 +1,10 @@
+change_id: CHG-E004
+description: Critical claim remains unsupported after the single repair attempt.
+category: api_contract
+primary_service: svc-payment-api
+origin_nodes:
+  - svc-payment-api
+repair_attempted: true
+critical_claims_unsupported: true
+evidence_coverage: 0.8
+expected_decision: REVIEW

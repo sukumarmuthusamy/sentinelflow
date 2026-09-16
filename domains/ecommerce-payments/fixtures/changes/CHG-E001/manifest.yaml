@@ -1,0 +1,8 @@
+change_id: CHG-E001
+description: Low-risk inventory documentation update.
+category: documentation
+primary_service: svc-inventory
+origin_nodes:
+  - svc-inventory
+evidence_coverage: 0.85
+expected_decision: PASS

@@ -1,0 +1,7 @@
+change_id: CHG-H003
+description: Verified secret exposure in configuration code.
+category: auth_security
+primary_service: svc-core-api
+origin_nodes:
+  - svc-core-api
+expected_decision: BLOCK

@@ -19,3 +19,11 @@ data_classification_labels:
   - pci-adjacent
   - internal
   - public
+non_code_paths:
+  extensions:
+    - .md
+    - .txt
+    - .rst
+    - .adoc
+  path_segments:
+    - docs

@@ -1,0 +1,13 @@
+{
+  "err_count": 1,
+  "warn_count": 0,
+  "info_count": 0,
+  "breaking": true,
+  "changes": [
+    {
+      "level": "ERR",
+      "message": "request property 'amount_cents' became optional",
+      "path": "/payments.post.requestBody"
+    }
+  ]
+}

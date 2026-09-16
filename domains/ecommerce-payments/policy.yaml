@@ -1,4 +1,5 @@
 evidence_floor: 0.75
+dependency_vuln_ceiling: high
 decision_thresholds:
   pass_max: 40
   review_max: 70
@@ -15,6 +16,18 @@ overrides:
     condition: oasdiff_err_on_critical_service
     outcome: BLOCK
     description: Breaking contract change on a critical service forces BLOCK.
+  - id: secret-exposure
+    condition: verified_secret_in_diff
+    outcome: BLOCK
+    description: Verified secret exposure forces BLOCK.
+  - id: weak-evidence
+    condition: evidence_coverage_below_floor
+    outcome: REVIEW
+    description: Insufficient evidence coverage forces REVIEW.
+  - id: unsupported-critical-claim
+    condition: critical_claim_unsupported_after_repair
+    outcome: REVIEW
+    description: Unsupported critical assertions after repair forces REVIEW.
   - id: dependency-vuln-ceiling
     condition: dependency_vuln_at_or_above_ceiling
     outcome: BLOCK

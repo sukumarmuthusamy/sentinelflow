@@ -1,0 +1,8 @@
+change_id: CHG-E003
+description: High-severity dependency vulnerability at or above the pack ceiling.
+category: dependency
+primary_service: svc-payment-api
+origin_nodes:
+  - svc-payment-api
+lockfile: lockfiles/requirements.txt
+expected_decision: BLOCK

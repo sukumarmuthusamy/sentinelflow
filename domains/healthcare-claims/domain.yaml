@@ -19,3 +19,12 @@ data_classification_labels:
   - regulated-adjacent
   - internal
   - public
+non_code_paths:
+  extensions:
+    - .md
+    - .txt
+    - .rst
+    - .adoc
+  path_segments:
+    - docs
+    - analytics_docs

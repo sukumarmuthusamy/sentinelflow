@@ -1,0 +1,14 @@
+{
+  "max_severity": "high",
+  "verified_secret_exposure": false,
+  "findings": [
+    {
+      "id": "osv-0",
+      "scanner": "osv-scanner",
+      "severity": "high",
+      "title": "GHSA-xxxx-yyyy-zzzz",
+      "detail": "Remote code execution in transitive dependency",
+      "rule_id": "GHSA-xxxx-yyyy-zzzz"
+    }
+  ]
+}

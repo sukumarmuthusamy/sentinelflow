@@ -1,0 +1,13 @@
+{
+  "err_count": 0,
+  "warn_count": 1,
+  "info_count": 0,
+  "breaking": false,
+  "changes": [
+    {
+      "level": "WARN",
+      "message": "response description changed",
+      "path": "/payments.post.responses.201"
+    }
+  ]
+}
