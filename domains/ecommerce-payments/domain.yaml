@@ -1,0 +1,21 @@
+pack_id: ecommerce-payments
+display_name: E-Commerce Payments Platform
+description: Synthetic e-commerce payments platform for portfolio demonstrations.
+services:
+  - name: svc-payment-api
+    criticality: critical
+    data_classification: pci-adjacent
+    owner: payments-team
+    description: Payment authorization and capture API.
+  - name: svc-inventory
+    criticality: high
+    data_classification: internal
+    owner: catalog-team
+  - name: svc-order-events
+    criticality: medium
+    data_classification: internal
+    owner: fulfillment-team
+data_classification_labels:
+  - pci-adjacent
+  - internal
+  - public

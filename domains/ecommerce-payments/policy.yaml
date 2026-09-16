@@ -1,0 +1,44 @@
+evidence_floor: 0.75
+decision_thresholds:
+  pass_max: 40
+  review_max: 70
+risk_weights:
+  blast_radius: 25
+  critical_service: 20
+  contract_break: 15
+  security_severity: 15
+  test_gap: 15
+  incident_similarity: 10
+  evidence_confidence_penalty: 10
+overrides:
+  - id: critical-contract-break
+    condition: oasdiff_err_on_critical_service
+    outcome: BLOCK
+    description: Breaking contract change on a critical service forces BLOCK.
+  - id: dependency-vuln-ceiling
+    condition: dependency_vuln_at_or_above_ceiling
+    outcome: BLOCK
+    description: High-severity dependency vulnerability forces BLOCK.
+allowed_agents:
+  - change_analyst
+  - evidence_investigator
+  - test_strategist
+  - security_auditor
+  - evidence_verifier
+default_plan:
+  - change_analyst
+  - evidence_investigator
+  - test_strategist
+  - security_auditor
+  - evidence_verifier
+category_agent_map:
+  documentation:
+    - change_analyst
+    - evidence_investigator
+    - evidence_verifier
+  api_contract:
+    - change_analyst
+    - evidence_investigator
+    - test_strategist
+    - security_auditor
+    - evidence_verifier

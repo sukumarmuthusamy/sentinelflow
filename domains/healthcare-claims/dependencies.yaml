@@ -1,0 +1,16 @@
+nodes:
+  - id: svc-core-api
+    type: service
+  - id: svc-notification
+    type: service
+  - id: svc-analytics
+    type: service
+edges:
+  - source: svc-core-api
+    target: svc-notification
+    kind: publishes_to
+    provenance: seed
+  - source: svc-core-api
+    target: svc-analytics
+    kind: publishes_to
+    provenance: seed

@@ -1,0 +1,16 @@
+nodes:
+  - id: svc-payment-api
+    type: service
+  - id: svc-inventory
+    type: service
+  - id: svc-order-events
+    type: service
+edges:
+  - source: svc-payment-api
+    target: svc-inventory
+    kind: calls
+    provenance: seed
+  - source: svc-payment-api
+    target: svc-order-events
+    kind: publishes_to
+    provenance: seed

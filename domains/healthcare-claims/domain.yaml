@@ -1,0 +1,21 @@
+pack_id: healthcare-claims
+display_name: Healthcare Claims Platform
+description: Synthetic healthcare claims processing platform for portfolio demonstrations.
+services:
+  - name: svc-core-api
+    criticality: critical
+    data_classification: regulated-adjacent
+    owner: platform-team
+    description: Primary API surface for core processing workflows.
+  - name: svc-notification
+    criticality: high
+    data_classification: internal
+    owner: messaging-team
+  - name: svc-analytics
+    criticality: medium
+    data_classification: internal
+    owner: data-team
+data_classification_labels:
+  - regulated-adjacent
+  - internal
+  - public
