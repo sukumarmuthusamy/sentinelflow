@@ -216,9 +216,7 @@ def list_domain_pack_ids(*, domains_root: Path | None = None) -> list[str]:
         return []
 
     return sorted(
-        path.name
-        for path in root.iterdir()
-        if path.is_dir() and (path / "domain.yaml").is_file()
+        path.name for path in root.iterdir() if path.is_dir() and (path / "domain.yaml").is_file()
     )
 
 

@@ -16,9 +16,7 @@ EXCLUDED_RELATIVE_PATHS = {
 
 def _iter_app_source_files() -> list[Path]:
     return sorted(
-        path
-        for path in APP_ROOT.rglob("*")
-        if path.suffix in SCAN_EXTENSIONS and path.is_file()
+        path for path in APP_ROOT.rglob("*") if path.suffix in SCAN_EXTENSIONS and path.is_file()
     )
 
 

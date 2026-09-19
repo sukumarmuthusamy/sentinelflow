@@ -113,9 +113,7 @@ def build_signals_from_fixture(
         origin_nodes=origins,
     )
 
-    contract_base = (
-        fixture_dir / manifest.contract_base if manifest.contract_base else None
-    )
+    contract_base = fixture_dir / manifest.contract_base if manifest.contract_base else None
     contract_revision = (
         fixture_dir / manifest.contract_revision if manifest.contract_revision else None
     )

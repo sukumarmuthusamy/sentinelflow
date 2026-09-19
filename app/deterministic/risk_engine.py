@@ -122,7 +122,9 @@ def compute_norms(signals: DeterministicSignals, domain_pack: DomainPack) -> Nor
             signals.available_tests,
         ),
         incident_similarity_norm=incident_similarity_norm(),
-        evidence_confidence_norm=evidence_confidence_norm(unsupported_assertion_rate=unsupported_rate),
+        evidence_confidence_norm=evidence_confidence_norm(
+            unsupported_assertion_rate=unsupported_rate
+        ),
     )
 
 

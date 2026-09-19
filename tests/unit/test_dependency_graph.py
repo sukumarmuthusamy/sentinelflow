@@ -55,14 +55,7 @@ def test_non_code_paths_skip_graph_edges() -> None:
 
 def test_non_code_origin_isolated_to_owner_service() -> None:
     pack = load_domain_pack("healthcare-claims", domains_root=DOMAINS_ROOT)
-    fixture_repo = (
-        DOMAINS_ROOT
-        / "healthcare-claims"
-        / "fixtures"
-        / "changes"
-        / "CHG-H001"
-        / "repo"
-    )
+    fixture_repo = DOMAINS_ROOT / "healthcare-claims" / "fixtures" / "changes" / "CHG-H001" / "repo"
     module_map = {"analytics_docs/readme.py": "svc-analytics"}
     graph = build_dependency_graph(
         domain_pack=pack,

@@ -1,0 +1,53 @@
+openapi: 3.1.0
+info:
+  title: svc-notification contract
+  version: 2.1.0
+  x-effective-date: '2025-10-15'
+  description: Synthetic OpenAPI contract for svc-notification.
+paths:
+  /v1/notification/health:
+    get:
+      operationId: svc-notification_health
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+  /v1/notification/submit:
+    post:
+      operationId: svc-notification_submit
+      summary: Submit primary workflow payload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitRequest'
+      responses:
+        '202':
+          description: Accepted
+        '409':
+          description: Conflict
+components:
+  schemas:
+    SubmitRequest:
+      type: object
+      required:
+      - correlation_id
+      - payload
+      properties:
+        correlation_id:
+          type: string
+        payload:
+          type: object
+        priority:
+          type: string
+          enum:
+          - normal
+          - urgent
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
