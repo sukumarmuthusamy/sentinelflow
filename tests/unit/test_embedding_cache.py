@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from app.rag.embedding_cache import (
     SQLiteEmbeddingCache,
     build_model_cache_key,

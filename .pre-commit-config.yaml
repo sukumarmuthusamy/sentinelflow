@@ -1,17 +1,18 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.4
+    rev: v0.16.7
     hooks:
+      # Check-only (no --fix): must match CI `uv run ruff check app tests`
       - id: ruff
-        args: [--fix]
       - id: ruff-format
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.14.0
+    rev: v2.3.1
     hooks:
       - id: mypy
         additional_dependencies:
           - pydantic>=2.10.0
           - pydantic-settings>=2.6.0
+          - types-networkx>=3.2.1
           - types-pyyaml>=6.0.12
         args: [--config-file=pyproject.toml]
         files: ^app/

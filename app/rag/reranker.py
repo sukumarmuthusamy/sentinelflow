@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from functools import lru_cache
+from typing import cast
 
 from sentence_transformers import CrossEncoder
 
@@ -42,7 +43,8 @@ class NoOpReranker(RerankerPort):
 
 @lru_cache
 def _get_cross_encoder(model_name: str) -> CrossEncoder:
-    return CrossEncoder(model_name, device=LOCAL_RERANKER_DEVICE)
+    # sentence_transformers ships no stubs; constructor is typed as returning Any.
+    return cast(CrossEncoder, CrossEncoder(model_name, device=LOCAL_RERANKER_DEVICE))
 
 
 class CrossEncoderReranker(RerankerPort):
