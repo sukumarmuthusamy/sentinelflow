@@ -7,6 +7,7 @@ from datetime import timedelta
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
 
+from app.core.settings import Settings, get_settings
 from app.graph.nodes import (
     budget_guard,
     check_remaining_steps,
@@ -34,12 +35,15 @@ def _approval_router(state: GraphState) -> str:
     return "end"
 
 
-def build_analysis_graph() -> StateGraph[GraphState, None, GraphState, GraphState]:
+def build_analysis_graph(
+    settings: Settings | None = None,
+) -> StateGraph[GraphState, None, GraphState, GraphState]:
     """Return an uncompiled StateGraph for the M4 analysis workflow."""
+    cfg = settings or get_settings()
     graph = StateGraph(GraphState)
 
     retry = RetryPolicy(max_attempts=2, initial_interval=0.5)
-    timeout = timedelta(seconds=120)
+    timeout = timedelta(seconds=cfg.analysis_node_timeout_seconds)
 
     graph.add_node("intake_validator", intake_validator, retry_policy=retry)
     graph.add_node("deterministic_signals", deterministic_signal_layer, retry_policy=retry)

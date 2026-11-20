@@ -32,3 +32,31 @@ def test_default_plan_is_allowed() -> None:
     default = default_plan_for_pack(pack)
     validated = validate_analysis_plan(default, pack)
     assert not validated.clamped_to_default or validated.agents
+
+
+def test_category_floor_restores_required_agents() -> None:
+    pack = load_domain_pack(
+        "healthcare-claims",
+        domains_root=get_settings().domains_root,
+    )
+    proposed = AnalysisPlan(
+        change_category="api_contract",
+        agents=["change_analyst"],
+        rationale="planner tried to skip agents",
+    )
+    validated = validate_analysis_plan(proposed, pack)
+    assert set(pack.policy.category_agent_map["api_contract"]) <= set(validated.agents)
+    assert not validated.clamped_to_default
+
+
+def test_long_rationale_truncated_not_rejected() -> None:
+    pack = load_domain_pack(
+        "healthcare-claims",
+        domains_root=get_settings().domains_root,
+    )
+    proposed = AnalysisPlan(
+        change_category="documentation",
+        agents=["change_analyst", "evidence_investigator"],
+        rationale="x" * 900,
+    )
+    assert len(validate_analysis_plan(proposed, pack).rationale) == 500

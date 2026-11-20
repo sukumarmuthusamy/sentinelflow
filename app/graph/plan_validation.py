@@ -71,9 +71,16 @@ def validate_analysis_plan(
         clamped = True
         agents = _dedupe_agents(list(domain_pack.policy.default_plan))
 
+    # category_agent_map is a floor: the planner may add allowed agents, never drop
+    # ones the policy requires for its chosen category.
+    for required in domain_pack.policy.category_agent_map.get(category, []):
+        if required in allowed and required not in agents:
+            agents.append(required)
+
     if "evidence_verifier" not in agents and "evidence_verifier" in allowed:
         agents.append("evidence_verifier")
 
+    agents.sort(key=lambda name: AGENT_SORT_KEYS[name])
     return AnalysisPlan(
         change_category=category,
         agents=agents,

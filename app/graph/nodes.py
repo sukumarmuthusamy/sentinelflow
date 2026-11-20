@@ -11,7 +11,12 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Overwrite, Send, interrupt
 from mcp_server.sentinelflow_context.models import RecordGateDecisionResponse
 
-from app.agents.contracts import ChangeImpact, EvidenceBundle
+from app.agents.contracts import (
+    ChangeImpact,
+    EvidenceBundle,
+    SecurityFindings,
+    VerificationReport,
+)
 from app.agents.execute import (
     run_change_analyst,
     run_evidence_investigator,
@@ -20,6 +25,7 @@ from app.agents.execute import (
     run_test_strategist,
     run_triage_planner,
 )
+from app.agents.queries import evidence_queries_from_signals, security_query_from_signals
 from app.core.domain_pack import load_domain_pack
 from app.deterministic.evaluate import build_signals_from_fixture, load_change_fixture_manifest
 from app.deterministic.evaluate import resolve_fixture_directory as resolve_fixture
@@ -29,6 +35,7 @@ from app.deterministic.risk_engine import compute_risk_score
 from app.graph.budget import BudgetExhaustedError
 from app.graph.context import AnalysisGraphContext
 from app.graph.plan_validation import (
+    default_plan_for_pack,
     parallel_agents_from_plan,
     validate_analysis_plan,
     verifier_scheduled,
@@ -44,7 +51,17 @@ from app.graph.state import (
     TraceMetrics,
 )
 from app.graph.typed_state import GraphState, completion_for_agent
+from app.graph.verification import (
+    MaterialAssertion,
+    VerificationMetrics,
+    compute_verification_metrics,
+    material_assertions,
+)
 from app.mcp_client.port import McpClientPort
+from app.model_gateway.llm import StructuredOutputError
+
+# Degrade to REVIEW when this few supersteps remain (repair loop plus graph tail).
+MIN_REMAINING_STEPS = 6
 
 
 def _ctx(config: RunnableConfig) -> AnalysisGraphContext:
@@ -67,6 +84,15 @@ def _signals(state: GraphState) -> DeterministicSignals | None:
     return DeterministicSignals.model_validate(raw)
 
 
+def _metrics(state: GraphState) -> VerificationMetrics | None:
+    raw = state.get("verification_metrics")
+    return VerificationMetrics.model_validate(raw) if raw else None
+
+
+def _degraded(reason: str) -> dict[str, Any]:
+    return {"degraded_to_review": True, "errors": [reason]}
+
+
 def _trace_update(ctx: AnalysisGraphContext) -> dict[str, Any]:
     return {
         "trace_metrics": TraceMetrics(
@@ -76,6 +102,7 @@ def _trace_update(ctx: AnalysisGraphContext) -> dict[str, Any]:
             retrieval_queries=ctx.trace.retrieval_queries,
             input_tokens=ctx.trace.input_tokens,
             output_tokens=ctx.trace.output_tokens,
+            citations_rejected=ctx.trace.citations_rejected,
         ).model_dump(),
     }
 
@@ -92,7 +119,6 @@ def intake_validator(state: GraphState, config: RunnableConfig) -> dict[str, Any
         "approval_status": ApprovalStatus.NOT_REQUESTED.value,
         "repair_count": state.get("repair_count", 0),
         "record_decision_written": False,
-        "degraded_to_review": state.get("degraded_to_review", False),
         "parallel_completions": [],
         "retrieved_evidence_ids": [],
     }
@@ -126,15 +152,27 @@ async def triage_planner_node(state: GraphState, config: RunnableConfig) -> dict
             f"change_id={signals.change_id} primary_service={signals.primary_service} "
             f"impacted={signals.impacted_services}"
         )
-    proposed = await run_triage_planner(
-        ctx.llm,
-        budget=ctx.budget,
-        trace=ctx.trace,
-        model=ctx.triage_model,
-        temperature=0.0,
-        change_summary=summary,
-        domain_pack_id=request.domain_pack_id,
-    )
+    try:
+        proposed = await run_triage_planner(
+            ctx.llm,
+            budget=ctx.budget,
+            trace=ctx.trace,
+            model=ctx.triage_model,
+            temperature=0.0,
+            change_summary=summary,
+            domain_pack_id=request.domain_pack_id,
+        )
+    except BudgetExhaustedError as exc:
+        plan = default_plan_for_pack(ctx.domain_pack)
+        return {"plan": plan.model_dump(), **_degraded(exc.reason), **_trace_update(ctx)}
+    except StructuredOutputError as exc:
+        # Plan section 2: an invalid plan clamps to the default; it is not retried.
+        plan = default_plan_for_pack(ctx.domain_pack)
+        return {
+            "plan": plan.model_dump(),
+            "errors": [f"triage plan invalid, clamped to default: {exc}"],
+            **_trace_update(ctx),
+        }
     plan = validate_analysis_plan(proposed, ctx.domain_pack)
     return {"plan": plan.model_dump(), **_trace_update(ctx)}
 
@@ -165,70 +203,89 @@ async def run_parallel_agent(state: GraphState, config: RunnableConfig) -> dict[
     request = _request(state)
     signals = _signals(state)
     updates: dict[str, Any] = {}
-
+    status = "ok"
     with ctx.budget.parallel_slot():
         ctx.trace.agent_steps += 1
-        if agent == "change_analyst":
-            impact = await run_change_analyst(
-                ctx.llm,
-                ctx.mcp,
-                budget=ctx.budget,
-                trace=ctx.trace,
-                model=ctx.agent_model,
-                temperature=ctx.agent_temperature,
-                request=request,
-                signals=signals.model_dump() if signals else {},
-            )
-            updates["change_impact"] = impact.model_dump()
-        elif agent == "evidence_investigator":
-            if ctx.retrieval is None:
-                updates["errors"] = ["retrieval service unavailable"]
-            else:
-                hypotheses: list[str] = []
-                if state.get("change_impact"):
-                    impact = ChangeImpact.model_validate(state["change_impact"])
-                    hypotheses = [hyp.statement for hyp in impact.risk_hypotheses]
-                bundle, chunks, id_set = await run_evidence_investigator(
-                    ctx.llm,
-                    ctx.retrieval,
-                    budget=ctx.budget,
-                    trace=ctx.trace,
-                    model=ctx.agent_model,
-                    temperature=ctx.agent_temperature,
-                    request=request,
-                    hypotheses=hypotheses,
-                )
-                updates["evidence"] = bundle.model_dump()
-                updates["retrieved_evidence_ids"] = sorted(id_set)
-                updates["retrieved_chunks"] = [chunk.model_dump() for chunk in chunks]
-        elif agent == "test_strategist":
-            plan = await run_test_strategist(
-                ctx.llm,
-                ctx.mcp,
-                budget=ctx.budget,
-                trace=ctx.trace,
-                model=ctx.agent_model,
-                temperature=ctx.agent_temperature,
-                request=request,
-            )
-            updates["regression_plan"] = plan.model_dump()
-        elif agent == "security_auditor":
-            sec = await run_security_auditor(
-                ctx.llm,
-                ctx.mcp,
-                ctx.retrieval,
-                budget=ctx.budget,
-                trace=ctx.trace,
-                model=ctx.agent_model,
-                temperature=ctx.agent_temperature,
-                request=request,
-            )
-            updates["security_findings"] = sec.model_dump()
-        else:
-            updates["errors"] = [f"unknown parallel agent: {agent}"]
+        try:
+            updates.update(await _dispatch_agent(agent, ctx, request, signals))
+        except BudgetExhaustedError as exc:
+            status = "budget_exhausted"
+            updates.update(_degraded(f"{agent}: {exc.reason}"))
 
-    updates["parallel_completions"] = [completion_for_agent(agent)]
+    updates["parallel_completions"] = [completion_for_agent(agent, status=status)]
     return updates
+
+
+async def _dispatch_agent(
+    agent: str,
+    ctx: AnalysisGraphContext,
+    request: AnalysisRequest,
+    signals: DeterministicSignals | None,
+) -> dict[str, Any]:
+    if agent == "change_analyst":
+        impact = await run_change_analyst(
+            ctx.llm,
+            ctx.mcp,
+            budget=ctx.budget,
+            trace=ctx.trace,
+            model=ctx.agent_model,
+            temperature=ctx.agent_temperature,
+            request=request,
+            signals=signals.model_dump() if signals else {},
+        )
+        return {"change_impact": impact.model_dump()}
+    if agent == "evidence_investigator":
+        if ctx.retrieval is None:
+            return {"errors": ["retrieval service unavailable"]}
+        # Runs in parallel with the Change Analyst, so it cannot see hypotheses;
+        # queries come from this change's deterministic signals instead.
+        queries = evidence_queries_from_signals(signals, fallback=request.objective)
+        bundle, outcome = await run_evidence_investigator(
+            ctx.llm,
+            ctx.retrieval,
+            budget=ctx.budget,
+            trace=ctx.trace,
+            model=ctx.agent_model,
+            temperature=ctx.agent_temperature,
+            queries=queries,
+        )
+        return {
+            "evidence": bundle.model_dump(),
+            "retrieved_evidence_ids": sorted(outcome.allowed_ids),
+            "retrieved_chunks": [chunk.model_dump() for chunk in outcome.chunks],
+            "rejected_evidence_ids": outcome.rejected_ids,
+        }
+    if agent == "test_strategist":
+        plan = await run_test_strategist(
+            ctx.llm,
+            ctx.mcp,
+            budget=ctx.budget,
+            trace=ctx.trace,
+            model=ctx.agent_model,
+            temperature=ctx.agent_temperature,
+            request=request,
+        )
+        return {"regression_plan": plan.model_dump()}
+    if agent == "security_auditor":
+        findings, outcome = await run_security_auditor(
+            ctx.llm,
+            ctx.mcp,
+            ctx.retrieval,
+            budget=ctx.budget,
+            trace=ctx.trace,
+            model=ctx.agent_model,
+            temperature=ctx.agent_temperature,
+            request=request,
+            security_query=security_query_from_signals(signals, fallback=request.objective),
+        )
+        # The verifier validates against retrieved_evidence_ids, so the auditor's
+        # evidence must land there too or its valid citations get stripped.
+        return {
+            "security_findings": findings.model_dump(),
+            "retrieved_evidence_ids": sorted(outcome.allowed_ids),
+            "rejected_evidence_ids": outcome.rejected_ids,
+        }
+    return {"errors": [f"unknown parallel agent: {agent}"]}
 
 
 async def merge_findings(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
@@ -246,30 +303,40 @@ async def evidence_verifier_node(state: GraphState, config: RunnableConfig) -> d
     if not verifier_scheduled(plan):
         return {}
 
+    impact_raw = state.get("change_impact")
+    security_raw = state.get("security_findings")
+    assertions = material_assertions(
+        ChangeImpact.model_validate(impact_raw) if impact_raw else None,
+        SecurityFindings.model_validate(security_raw) if security_raw else None,
+    )
     allowed = set(state.get("retrieved_evidence_ids") or [])
     specialist_payload = {
-        "change_impact": state.get("change_impact"),
+        "change_impact": impact_raw,
         "evidence": state.get("evidence"),
         "regression_plan": state.get("regression_plan"),
-        "security_findings": state.get("security_findings"),
+        "security_findings": security_raw,
     }
-    report = await run_evidence_verifier(
-        ctx.llm,
-        budget=ctx.budget,
-        trace=ctx.trace,
-        model=ctx.agent_model,
-        temperature=ctx.agent_temperature,
-        allowed_ids=allowed,
-        specialist_payload=specialist_payload,
-    )
-    gaps = [
-        item.assertion_id
-        for item in report.assertion_assessments
-        if item.status in {"unsupported", "contradicted"}
-    ]
+    report: VerificationReport
+    try:
+        report, rejected = await run_evidence_verifier(
+            ctx.llm,
+            budget=ctx.budget,
+            trace=ctx.trace,
+            model=ctx.agent_model,
+            temperature=ctx.agent_temperature,
+            allowed_ids=allowed,
+            assertions=assertions,
+            specialist_payload=specialist_payload,
+        )
+    except BudgetExhaustedError as exc:
+        return {**_degraded(f"evidence_verifier: {exc.reason}"), **_trace_update(ctx)}
+
+    metrics = compute_verification_metrics(assertions, report, signals=_signals(state))
     return {
         "verification": report.model_dump(),
-        "evidence_gaps": gaps,
+        "verification_metrics": metrics.model_dump(),
+        "evidence_gaps": list(metrics.unsupported_ids),
+        "rejected_evidence_ids": rejected,
         **_trace_update(ctx),
     }
 
@@ -279,53 +346,82 @@ def coverage_router(
 ) -> Literal["repair", "risk_engine", "degrade_review"]:
     if state.get("degraded_to_review"):
         return "degrade_review"
-    domain = load_domain_pack(state["domain_pack_id"])
-    floor = domain.policy.evidence_floor
-    verification = state.get("verification") or {}
-    coverage = float(verification.get("evidence_coverage") or 0.0)
+    remaining = state.get("remaining_steps")
+    if isinstance(remaining, int) and remaining <= MIN_REMAINING_STEPS:
+        return "degrade_review"
+    metrics = _metrics(state)
+    if metrics is None or metrics.evidence_coverage is None:
+        return "risk_engine"
+    floor = load_domain_pack(state["domain_pack_id"]).policy.evidence_floor
     repair_count = int(state.get("repair_count") or 0)
-    if coverage < floor and repair_count < 1:
+    if metrics.evidence_coverage < floor and repair_count < 1:
         return "repair"
     return "risk_engine"
+
+
+def _repair_queries(
+    state: GraphState,
+    metrics: VerificationMetrics | None,
+    request: AnalysisRequest,
+) -> list[str]:
+    """Query with the text of unsupported assertions, never their opaque IDs."""
+    gaps = set(state.get("evidence_gaps") or [])
+    texts: list[str] = []
+    if metrics is not None:
+        by_id: dict[str, MaterialAssertion] = {a.assertion_id: a for a in metrics.assertions}
+        texts = [by_id[gap].text for gap in sorted(gaps) if gap in by_id]
+    if texts:
+        return texts[:5]
+    return evidence_queries_from_signals(_signals(state), fallback=request.objective)
 
 
 async def focused_retrieval_repair(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     ctx = _ctx(config)
     request = _request(state)
-    gaps = list(state.get("evidence_gaps") or [])
-    verification = state.get("verification") or {}
-    if verification.get("repair_recommended"):
-        gaps.append("verification_repair")
+    repair_count = int(state.get("repair_count") or 0) + 1
     if ctx.retrieval is None:
         return {
-            "repair_count": int(state.get("repair_count") or 0) + 1,
+            "repair_count": repair_count,
             "evidence_gaps": Overwrite([]),
             "errors": ["retrieval unavailable during repair"],
         }
 
     bundle_raw = state.get("evidence")
     prior = EvidenceBundle.model_validate(bundle_raw) if bundle_raw else EvidenceBundle()
-    queries = gaps or prior.unsupported_hypothesis_ids or [request.objective]
+    queries = _repair_queries(state, _metrics(state), request)
+    try:
+        repaired, outcome = await run_evidence_investigator(
+            ctx.llm,
+            ctx.retrieval,
+            budget=ctx.budget,
+            trace=ctx.trace,
+            model=ctx.agent_model,
+            temperature=ctx.agent_temperature,
+            queries=queries,
+        )
+    except BudgetExhaustedError as exc:
+        return {
+            "repair_count": repair_count,
+            "evidence_gaps": Overwrite([]),
+            **_degraded(f"repair: {exc.reason}"),
+            **_trace_update(ctx),
+        }
+    # Repair exists to find NEW evidence: cite against what this repair retrieved,
+    # then union with the earlier set (an intersection would discard new evidence).
     existing_ids = set(state.get("retrieved_evidence_ids") or [])
-    repaired, chunks, id_set = await run_evidence_investigator(
-        ctx.llm,
-        ctx.retrieval,
-        budget=ctx.budget,
-        trace=ctx.trace,
-        model=ctx.agent_model,
-        temperature=ctx.agent_temperature,
-        request=request,
-        hypotheses=queries,
-        allowed_ids=existing_ids,
+    merged = repaired.model_copy(
+        update={
+            "items": prior.items + repaired.items,
+            "retrieval_queries": prior.retrieval_queries + repaired.retrieval_queries,
+        },
     )
-    id_set = existing_ids | id_set
-    merged_items = prior.items + repaired.items
-    merged = repaired.model_copy(update={"items": merged_items, "coverage": repaired.coverage})
+    prior_chunks = list(state.get("retrieved_chunks") or [])
     return {
         "evidence": merged.model_dump(),
-        "retrieved_evidence_ids": sorted(id_set),
-        "retrieved_chunks": [chunk.model_dump() for chunk in chunks],
-        "repair_count": int(state.get("repair_count") or 0) + 1,
+        "retrieved_evidence_ids": sorted(existing_ids | outcome.allowed_ids),
+        "retrieved_chunks": prior_chunks + [chunk.model_dump() for chunk in outcome.chunks],
+        "rejected_evidence_ids": outcome.rejected_ids,
+        "repair_count": repair_count,
         "evidence_gaps": Overwrite([]),
         **_trace_update(ctx),
     }
@@ -337,20 +433,17 @@ def risk_engine_node(state: GraphState, config: RunnableConfig) -> dict[str, Any
     if signals is None:
         return {"errors": ["missing deterministic signals"]}
 
-    verification = state.get("verification") or {}
-    unsupported_rate = float(verification.get("unsupported_assertion_rate") or 0.0)
-    coverage = verification.get("evidence_coverage")
+    metrics = _metrics(state)
     repair_count = int(state.get("repair_count") or 0)
-    critical_unsupported = unsupported_rate >= 0.5
-    updated = signals.model_copy(
-        update={
-            "evidence_coverage": (
-                float(coverage) if coverage is not None else signals.evidence_coverage
-            ),
-            "critical_claims_unsupported": critical_unsupported,
-            "repair_attempted": repair_count > 0,
-        },
-    )
+    update: dict[str, Any] = {"repair_attempted": repair_count > 0}
+    unsupported_rate = 0.0
+    if metrics is not None:
+        # Computed in code from per-assertion judgments, not the verifier's self-report.
+        update["evidence_coverage"] = metrics.evidence_coverage
+        update["unsupported_assertion_rate"] = metrics.unsupported_assertion_rate
+        update["critical_claims_unsupported"] = metrics.critical_unsupported
+        unsupported_rate = metrics.unsupported_assertion_rate or 0.0
+    updated = signals.model_copy(update=update)
     risk = compute_risk_score(updated, ctx.domain_pack)
     gate = apply_policy_gate(updated, ctx.domain_pack, risk)
     assessment = RiskAssessment(
@@ -366,13 +459,18 @@ def risk_engine_node(state: GraphState, config: RunnableConfig) -> dict[str, Any
     }
 
 
+def _degraded_decision(computed: ReleaseDecision) -> ReleaseDecision:
+    """Degradation means "a human must look", so it never weakens a deterministic BLOCK."""
+    return ReleaseDecision.BLOCK if computed == ReleaseDecision.BLOCK else ReleaseDecision.REVIEW
+
+
 def degrade_review_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     ctx = _ctx(config)
     existing = state.get("risk_assessment")
     if existing:
         patched = {
             **existing,
-            "decision": ReleaseDecision.REVIEW.value,
+            "decision": _degraded_decision(ReleaseDecision(existing["decision"])).value,
             "override_applied": existing.get("override_applied") or "budget_or_recursion",
         }
         return {"risk_assessment": patched, "degraded_to_review": True}
@@ -391,9 +489,9 @@ def degrade_review_node(state: GraphState, config: RunnableConfig) -> dict[str, 
     gate = apply_policy_gate(signals, ctx.domain_pack, risk)
     assessment = RiskAssessment(
         risk_score=gate.risk_score,
-        decision=ReleaseDecision.REVIEW,
+        decision=_degraded_decision(ReleaseDecision(gate.decision)),
         confidence=0.5,
-        override_applied="budget_or_recursion",
+        override_applied=gate.override_applied or "budget_or_recursion",
         component_scores=risk.weighted_components,
     )
     return {"risk_assessment": assessment.model_dump(), "degraded_to_review": True}
@@ -406,7 +504,7 @@ def report_builder_node(state: GraphState, config: RunnableConfig) -> dict[str, 
     verification = state.get("verification") or {}
     findings: list[CriticalFinding] = []
     for item in verification.get("assertion_assessments") or []:
-        if item.get("status") != "supported":
+        if item.get("status") != "supported" or not item.get("evidence_ids"):
             continue
         findings.append(
             CriticalFinding(
@@ -422,6 +520,7 @@ def report_builder_node(state: GraphState, config: RunnableConfig) -> dict[str, 
 
     signals = _signals(state)
     impacted = signals.impacted_services if signals else []
+    metrics = _metrics(state)
     report = ReleaseReport(
         analysis_id=state["analysis_id"],
         decision=assessment.decision,
@@ -430,7 +529,7 @@ def report_builder_node(state: GraphState, config: RunnableConfig) -> dict[str, 
         impacted_services=list(impacted),
         critical_findings=findings,
         recommended_tests=tests,
-        evidence_coverage=float(verification.get("evidence_coverage") or 0.0),
+        evidence_coverage=metrics.evidence_coverage if metrics is not None else None,
         requires_human_approval=request.record_decision,
     )
     return {"final_report": report.model_dump()}
@@ -487,7 +586,7 @@ async def record_gate_decision_node(state: GraphState, config: RunnableConfig) -
 def check_remaining_steps(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     _ = config
     remaining = state.get("remaining_steps", 999)
-    if isinstance(remaining, int) and remaining <= 2:
+    if isinstance(remaining, int) and remaining <= MIN_REMAINING_STEPS:
         return {"degraded_to_review": True}
     return {}
 
@@ -497,5 +596,5 @@ def budget_guard(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     try:
         ctx.budget.check_llm_call()
     except BudgetExhaustedError as exc:
-        return {"degraded_to_review": True, "errors": [exc.reason]}
+        return _degraded(exc.reason)
     return {}

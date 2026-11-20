@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from app.agents.contracts import (
     AssertionAssessment,
-    ChangeImpact,
     EvidenceBundle,
     EvidenceCitation,
     EvidenceItem,
@@ -86,11 +85,3 @@ def validate_bundle_citations(
     items, rejected = filter_evidence_items(bundle.items, allowed_ids)
     return bundle.model_copy(update={"items": items}), rejected
 
-
-def strip_invalid_hypothesis_citations(
-    impact: ChangeImpact,
-    allowed_ids: set[str],
-) -> ChangeImpact:
-    """Change Analyst must not cite KB evidence; strip any hallucinated IDs in text fields."""
-    _ = allowed_ids
-    return impact

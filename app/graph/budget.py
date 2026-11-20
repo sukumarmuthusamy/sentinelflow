@@ -38,18 +38,23 @@ class AnalysisBudget:
         )
 
     def check_llm_call(self) -> None:
+        """Raise before a call when any call or token budget is already spent."""
         if self.llm_calls >= self.max_llm_calls:
             raise BudgetExhaustedError("max_llm_calls exceeded")
+        if self.input_tokens >= self.max_input_tokens:
+            raise BudgetExhaustedError("max_input_tokens exceeded")
+        if self.output_tokens >= self.max_output_tokens:
+            raise BudgetExhaustedError("max_output_tokens exceeded")
 
     def record_llm_call(self, *, input_tokens: int = 0, output_tokens: int = 0) -> None:
-        self.check_llm_call()
+        """Account for a completed call.
+
+        Never raises: the call already happened and its output is kept. Overruns are
+        caught by the next ``check_llm_call``.
+        """
         self.llm_calls += 1
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
-        if self.input_tokens > self.max_input_tokens:
-            raise BudgetExhaustedError("max_input_tokens exceeded")
-        if self.output_tokens > self.max_output_tokens:
-            raise BudgetExhaustedError("max_output_tokens exceeded")
 
     @dataclass
     class ParallelSlot:
@@ -77,6 +82,7 @@ class TraceAccumulator:
     retrieval_queries: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    citations_rejected: int = 0
 
     def bump_llm(self, *, input_tokens: int = 0, output_tokens: int = 0) -> None:
         self.llm_calls += 1

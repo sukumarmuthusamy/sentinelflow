@@ -15,7 +15,7 @@ from pathlib import Path
 from app.agents.contracts import ChangeImpact
 from app.agents.mcp_tools import context_json, mcp_change_analyst_context
 from app.agents.prompts import PROMPT_VERSION
-from app.agents.prompts import v1 as prompts
+from app.agents.prompts import v2 as prompts
 from app.core.settings import get_settings
 from app.graph.state import AnalysisRequest
 from app.mcp_client import SentinelFlowMcpAdapter
@@ -24,7 +24,7 @@ from app.model_gateway.errors import (
     is_quota_or_rate_limit_error,
     is_transient_api_error,
 )
-from app.model_gateway.llm import GeminiStructuredLLM
+from app.model_gateway.llm import GeminiStructuredLLM, StructuredOutputError
 from app.model_gateway.pacing import (
     AsyncMinIntervalPacer,
     estimate_paced_wall_seconds,
@@ -89,15 +89,15 @@ async def _one_attempt(
 ) -> AttemptResult:
     await pacer.wait_turn()
     try:
-        impact = await llm.generate(
+        impact = (await llm.generate(
             model=model,
             temperature=temperature,
             system_prompt=prompts.CHANGE_ANALYST_SYSTEM,
             user_prompt=user_prompt,
             schema=ChangeImpact,
-        )
+        )).value
         ChangeImpact.model_validate(impact.model_dump())
-    except ValidationError as exc:
+    except (ValidationError, StructuredOutputError) as exc:
         return AttemptResult(AttemptOutcome.INVALID, str(exc)[:200])
     except Exception as exc:  # noqa: BLE001 — sweep must never crash the run
         if is_daily_quota_exhausted(exc):
@@ -111,13 +111,13 @@ async def _one_attempt(
             await asyncio.sleep(quota_retry_wait_seconds)
             try:
                 await pacer.wait_turn()
-                impact = await llm.generate(
+                impact = (await llm.generate(
                     model=model,
                     temperature=temperature,
                     system_prompt=prompts.CHANGE_ANALYST_SYSTEM,
                     user_prompt=user_prompt,
                     schema=ChangeImpact,
-                )
+                )).value
                 ChangeImpact.model_validate(impact.model_dump())
                 return AttemptResult(AttemptOutcome.OK)
             except Exception as retry_exc:  # noqa: BLE001
@@ -133,13 +133,13 @@ async def _one_attempt(
             await asyncio.sleep(15.0)
             try:
                 await pacer.wait_turn()
-                impact = await llm.generate(
+                impact = (await llm.generate(
                     model=model,
                     temperature=temperature,
                     system_prompt=prompts.CHANGE_ANALYST_SYSTEM,
                     user_prompt=user_prompt,
                     schema=ChangeImpact,
-                )
+                )).value
                 ChangeImpact.model_validate(impact.model_dump())
                 return AttemptResult(AttemptOutcome.OK)
             except Exception as retry_exc:  # noqa: BLE001

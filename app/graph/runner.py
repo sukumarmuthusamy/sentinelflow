@@ -54,6 +54,8 @@ def _initial_state(request: AnalysisRequest, analysis_id: str | None = None) -> 
         "final_report": None,
         "errors": [],
         "parallel_completions": [],
+        "rejected_evidence_ids": [],
+        "verification_metrics": None,
         "degraded_to_review": False,
         "record_decision_written": False,
     }
@@ -119,7 +121,7 @@ async def run_analysis(
     }
     try:
         async with _checkpointer(cfg.graph_checkpoint_path) as checkpointer:
-            compiled = build_analysis_graph().compile(checkpointer=checkpointer)
+            compiled = build_analysis_graph(cfg).compile(checkpointer=checkpointer)
             state_in = cast(GraphState, _initial_state(request, analysis_id))
             result: dict[str, Any] = await compiled.ainvoke(
                 state_in,
@@ -160,7 +162,7 @@ async def resume_analysis(
     }
     try:
         async with _checkpointer(cfg.graph_checkpoint_path) as checkpointer:
-            compiled = build_analysis_graph().compile(checkpointer=checkpointer)
+            compiled = build_analysis_graph(cfg).compile(checkpointer=checkpointer)
             return await compiled.ainvoke(
                 Command(resume=resume_payload),
                 config=config,

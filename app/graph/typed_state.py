@@ -59,7 +59,12 @@ class GraphState(TypedDict):
     final_report: dict[str, Any] | None
     errors: Annotated[list[str], operator.add]
     parallel_completions: Annotated[list[ParallelCompletion], merge_parallel_completions]
-    degraded_to_review: bool
+    # Citations an agent emitted that were absent from its retrieved set (pre-filter).
+    rejected_evidence_ids: Annotated[list[str], operator.add]
+    # Deterministic coverage/unsupported metrics (app/graph/verification.py).
+    verification_metrics: dict[str, Any] | None
+    # OR-reduced: any parallel branch may flip it in the same superstep.
+    degraded_to_review: Annotated[bool, operator.or_]
     record_decision_written: bool
     agent_name: NotRequired[str]
     sort_key: NotRequired[int]

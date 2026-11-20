@@ -1,4 +1,4 @@
-# Engineering Journal (M0–M3)
+# Engineering Journal (M0–M4)
 
 Technical notes on problems that looked like bugs, tooling failures, or “too good to be true” metrics — and the judgments that followed. For architecture and roadmap, see [SENTINELFLOW_PLAN.md](../SENTINELFLOW_PLAN.md).
 
@@ -91,3 +91,38 @@ This is an explicit engineering tradeoff: **hosted reranking for evaluation velo
 | `gemini-3-flash-preview` | Proxy run, 9 calls, 130s | 2/3 valid | 3/3 | 3/3 | One 503 on 0.0 repeat 3 |
 
 **Provisional agent temperature:** **`0.2`** (`AGENT_LLM_TEMPERATURE`) — highest schema-validity rate on the proxy run; **confirm on `gemini-3.8-flash`** when daily quota resets (`evals/graph/temperature_sweep.json`). `gemini-3.5-flash-lite` ignores temperature (fixed sampling); not valid for this experiment.
+
+---
+
+## M4 review: the LLM was scoring its own evidence, and weak evidence lowered risk
+
+**What looked wrong.** A code review of the M4 graph (before any live run) traced how the Evidence Verifier's output reached the gate. Two things contradicted the project's thesis that code, not the model, computes the verdict: (1) `evidence_coverage` and `unsupported_assertion_rate` were read straight from the verifier's own `VerificationReport`, and those numbers drove both the coverage-floor `REVIEW` override and the risk score; (2) more unsupported assertions produced a *lower* risk score.
+
+**Investigation.** For (1), the verifier is an LLM; nothing checked that its reported coverage matched its own per-assertion judgments. A report claiming `evidence_coverage=1.0` with zero assessments sailed past the floor. For (2), `apply_weights` applied `-weight * evidence_confidence_norm`, and `evidence_confidence_norm` *is* the unsupported rate. The sign was inherited from plan section 4's formula (`- 10 * evidence_confidence_norm # penalty: unsupported-claim rate`), which reads as a discount but was fed a penalty input. The `REVIEW` override masked it only when a repair had already happened. All eight M1 fixtures were re-run after the fix to confirm no verdict changed.
+
+**Root cause.** (1) The LLM's summary statistics crossed the deterministic boundary unchecked. (2) A term named "confidence" carried an "unsupported" quantity, and the sign followed the name rather than the value.
+
+**Decision.**
+
+- Coverage, unsupported rate and the critical-unsupported flag are computed in code (`app/graph/verification.py`) from the per-assertion judgments, after invalid evidence IDs are stripped. An assertion counts as supported only if the verifier assessed it by its exact ID as `supported` with at least one surviving citation. Skipped assertions count as unsupported. The verifier's self-reported numbers are kept as `llm_reported_*` for comparison in M6, never as gate inputs.
+- Material assertions are the Change Analyst's hypotheses and the Security Auditor's findings, namespaced `hyp:` / `sec:`. With none, coverage is `None` (floor not applied), unless deterministic signals show a contract break or scanner finding, in which case it is `0.0`.
+- The penalty term is now added. Agent output can only make the gate stricter, never lower a deterministic score. Plan section 4 is updated to match.
+- Known limit: an agent that emits no assertions on a change with clean deterministic signals gets `None` coverage. That is acceptable because the verdict is then fully deterministic, but M6 should measure how often it happens.
+
+Tests: `tests/unit/test_verification_metrics.py`, `tests/unit/test_risk_engine.py::TestEvidencePenaltySign`, `tests/graph/test_gate_integrity.py::test_verifier_self_reported_coverage_is_ignored`.
+
+---
+
+## M4 review: parallel fan-out starved the Evidence Investigator of change context
+
+**What looked wrong.** The Evidence Investigator was meant to retrieve evidence for the Change Analyst's hypotheses, but the hypotheses list was always empty, so every change retrieved the same documents with the same query: the fixed `request.objective` string.
+
+**Investigation.** `Send` fan-out copies graph state at dispatch time. The Change Analyst and Evidence Investigator run in the *same* superstep, so `state["change_impact"]` is always `None` when the investigator starts. Tracing further turned up three related wiring faults: the Security Auditor queried with the change ID (`"... CHG-H001"`), which means nothing to an embedding model; its retrieved evidence IDs never reached `retrieved_evidence_ids`, so the verifier stripped its valid citations; and the repair loop (a) queried with opaque assertion IDs rather than their text and (b) intersected newly retrieved IDs with the *old* set, discarding exactly the new evidence repair exists to find.
+
+**Root cause.** The topology (parallel specialists, plan section 2) and the data dependency (investigator needs hypotheses) disagreed, and the fallback hid it.
+
+**Decision.** Keep the parallel topology and source queries from the deterministic signal layer, which exists before fan-out and is specific to each change: primary service, contract-diff messages, scanner findings, downstream services, prior incidents (`app/agents/queries.py`). The Security Auditor's query uses scanner findings, and its IDs merge into `retrieved_evidence_ids`. Repair queries with the text of unsupported assertions and unions new IDs with old ones. Making the investigator wait for the Change Analyst was rejected: it serializes the slowest two agents and still would not help the Security Auditor. Prompts bumped to `v2` (v1 is kept so the earlier sweep stays reproducible).
+
+Related fixes in the same pass: budget exhaustion inside an agent now degrades to `REVIEW` instead of raising through `RetryPolicy`, and degradation never weakens a deterministic `BLOCK`; token usage is captured from the provider (`include_raw=True`) so the token budget is real; citations stripped by the evidence-ID validator are recorded (`rejected_evidence_ids`) so "zero invented IDs" is measurable; the policy's `category_agent_map` is enforced as a floor on the triage plan.
+
+Tests: `tests/unit/test_evidence_queries.py`, `tests/unit/test_budget.py`, `tests/graph/test_gate_integrity.py`.

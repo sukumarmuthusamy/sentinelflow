@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import sys
+import uuid
 from pathlib import Path
 
 from app.graph.evidence_ids import evidence_id
@@ -55,7 +56,8 @@ async def _run_one(
         domain_pack_id=str(row["domain_pack_id"]),
         record_decision=bool(row.get("record_decision", False)),
     )
-    thread_id = f"m4-{request.change_id}"
+    # Unique per run: reusing a thread would merge reducer fields from the prior run.
+    thread_id = f"m4-{request.change_id}-{uuid.uuid4().hex[:8]}"
     async with SentinelFlowMcpAdapter(mcp) as adapter:
         try:
             state = await run_analysis(
@@ -80,12 +82,23 @@ async def _run_one(
             )
 
     total, invalid_count, invalid = _citation_validity(state)
+    invented = list(state.get("rejected_evidence_ids") or [])
     decision = (state.get("risk_assessment") or {}).get("decision")
+    metrics = state.get("verification_metrics") or {}
+    trace = state.get("trace_metrics") or {}
     print(
-        f"{request.change_id} decision={decision} citations={total} invalid={invalid_count}",
+        f"{request.change_id} decision={decision} "
+        f"citations={total} invalid_after_filter={invalid_count} "
+        f"invented_before_filter={len(invented)} "
+        f"coverage={metrics.get('evidence_coverage')} "
+        f"(llm_reported={metrics.get('llm_reported_evidence_coverage')}) "
+        f"llm_calls={trace.get('llm_calls')} tokens_in={trace.get('input_tokens')} "
+        f"degraded={state.get('degraded_to_review')}",
     )
     if invalid:
         print(f"  invalid ids: {invalid[:5]}", file=sys.stderr)
+    if invented:
+        print(f"  invented ids (stripped): {invented[:5]}", file=sys.stderr)
 
 
 async def main() -> None:
