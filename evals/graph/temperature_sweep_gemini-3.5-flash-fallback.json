@@ -1,0 +1,52 @@
+{
+  "meta": {
+    "change_id": "CHG-H001",
+    "domain_pack_id": "healthcare-claims",
+    "model": "gemini-3.5-flash",
+    "repeats_per_temperature": 3,
+    "temperatures": [
+      0.0,
+      0.2,
+      1.0
+    ],
+    "generation_rpm_limit": 5,
+    "min_interval_seconds": 12.5,
+    "elapsed_seconds": 272.7,
+    "prompt_version": "v1",
+    "client_max_retries": 0,
+    "notes": "Free tier: gemini-3.8-flash is often 5 RPM and 20 RPD; use --repeats 1 (3 calls) when near daily cap. SDK retries disabled so paced calls are not multiplied."
+  },
+  "recommended_agent_llm_temperature": 0.0,
+  "arms": {
+    "0.0": {
+      "schema_valid_rate": 0.6666666666666666,
+      "schema_valid_count": 2,
+      "attempts": 3,
+      "outcomes": [
+        "ok",
+        "transient_api",
+        "ok"
+      ]
+    },
+    "0.2": {
+      "schema_valid_rate": 0.6666666666666666,
+      "schema_valid_count": 2,
+      "attempts": 3,
+      "outcomes": [
+        "transient_api",
+        "ok",
+        "ok"
+      ]
+    },
+    "1.0": {
+      "schema_valid_rate": 0.6666666666666666,
+      "schema_valid_count": 2,
+      "attempts": 3,
+      "outcomes": [
+        "transient_api",
+        "ok",
+        "ok"
+      ]
+    }
+  }
+}

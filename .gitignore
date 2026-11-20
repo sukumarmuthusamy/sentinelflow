@@ -29,6 +29,7 @@ env/
 
 # Runtime output (not source)
 .sentinelflow/
+.tmp/
 evals/retrieval/reports/
 
 # Distribution / packaging

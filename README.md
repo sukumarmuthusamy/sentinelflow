@@ -10,7 +10,7 @@ SentinelFlow ingests a proposed software change and produces an **evidence-cited
 | **M1** | Complete | Deterministic signal layer: import graph, blast radius, oasdiff/buf, security scanners, risk engine, policy gate |
 | **M2** | Complete | `sentinelflow-context` MCP server (7 tools, 3 resources), typed client adapter |
 | **M3** | Complete | Hybrid RAG, pgvector + Qdrant adapters, Gemini embeddings, reranker ablation (none vs Voyage), eval harness |
-| **M4** | Not started | LangGraph agents, triage planner, evidence verifier, temperature sweep |
+| **M4** | In progress | LangGraph workflow, five agents, triage planner, checkpoint + interrupt; live sample/sweep need `GEMINI_API_KEY` |
 
 Canonical architecture and roadmap: [SENTINELFLOW_PLAN.md](SENTINELFLOW_PLAN.md).  
 Real obstacles and tradeoffs from M0–M3: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
@@ -280,6 +280,12 @@ We evaluated local cross-encoder reranking and chose hosted Voyage for ablation 
 
 ---
 
-## M4 — Agents and graph (not yet started)
+## M4 — Agents and graph
 
-Next milestone: LangGraph orchestration, five specialist agents, triage planner, evidence verifier, and empirical Gemini temperature sweep. See [SENTINELFLOW_PLAN.md § M4](SENTINELFLOW_PLAN.md).
+Callable from Python (no HTTP yet): `app/graph/` wires intake → deterministic signals → triage planner → parallel agents (`Send` + `defer=True` merge) → Evidence Verifier → optional repair (`Overwrite` on gaps) → risk engine → policy gate → report → `interrupt()` → `record_gate_decision`.
+
+- **Run sample scenarios:** `uv run python scripts/run_m4_sample.py` (requires `GEMINI_API_KEY`, pgvector for retrieval)
+- **Temperature sweep:** `uv run python scripts/temperature_sweep.py` (writes `evals/graph/temperature_sweep.json`)
+- **Tests:** `tests/graph/test_interrupt_resume.py` (static LLM + checkpoint resume)
+
+See [SENTINELFLOW_PLAN.md § M4](SENTINELFLOW_PLAN.md) for exit criteria.

@@ -64,7 +64,30 @@ class Settings(BaseSettings):
     retrieval_top_k: int = 10
     rerank_top_n: int = 5
 
-    @field_validator("domains_root", "embedding_cache_path", mode="before")
+    # M4 — agents and graph (model IDs per SENTINELFLOW_PLAN.md section 6)
+    agent_llm_model: str = "gemini-3.8-flash"
+    triage_llm_model: str = "gemini-3.5-flash-lite"
+    agent_llm_temperature: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=2.0,
+        description=(
+            "Primary agent temperature; M4 sweep proxy (gemini-3-flash-preview) favored 0.2 — "
+            "confirm on gemini-3.8-flash after daily quota reset"
+        ),
+    )
+    graph_recursion_limit: int = Field(default=40, ge=5, le=200)
+    graph_checkpoint_path: Path = Field(
+        default_factory=lambda: Path(".sentinelflow/graph_checkpoints.sqlite"),
+        description="SQLite checkpoint database for LangGraph (gitignored)",
+    )
+    analysis_max_llm_calls: int = Field(default=25, ge=1)
+    analysis_max_input_tokens: int = Field(default=200_000, ge=1_000)
+    analysis_max_output_tokens: int = Field(default=50_000, ge=1_000)
+    analysis_max_parallel_agents: int = Field(default=4, ge=1, le=4)
+    analysis_node_timeout_seconds: float = Field(default=120.0, ge=10.0)
+
+    @field_validator("domains_root", "embedding_cache_path", "graph_checkpoint_path", mode="before")
     @classmethod
     def resolve_repo_relative_path(cls, value: Path | str) -> Path:
         path = Path(value)

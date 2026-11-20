@@ -31,6 +31,8 @@ dependencies = [
     "tree-sitter-python>=0.25",
     "uvicorn[standard]>=0.32.0",
     "voyageai>=0.3.0",
+    "langgraph>=1.2.11",
+    "langgraph-checkpoint-sqlite>=3.1.1",
 ]
 
 [project.optional-dependencies]
@@ -97,6 +99,14 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "voyageai.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "langgraph.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "langgraph.checkpoint.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

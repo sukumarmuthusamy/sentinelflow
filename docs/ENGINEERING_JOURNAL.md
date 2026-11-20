@@ -66,3 +66,28 @@ Extrapolated: ~17 hours for the local arm of the full ablation alone (71 queries
 **Decision.** Document local reranking as **CPU-only, optional, and excluded from eval sweeps on constrained hardware** (`--skip-local-reranker`). Operational ablation: **none vs Voyage** (`rerank-2.5-lite`). Measured outcome: recall@10 stayed at 1.00 on all arms; Voyage improved MRR/nDCG on hard batches (e.g. ecommerce hard MRR 0.93 → 0.96). See [README M3 section](../README.md#m3--retrieval) and `evals/retrieval/reports/latest.json` for full numbers.
 
 This is an explicit engineering tradeoff: **hosted reranking for evaluation velocity and reproducibility on dev laptops**, with local cross-encoders retained for environments that have the RAM and CPU/GPU to run them.
+
+---
+
+## M4 temperature sweep: free-tier pacing, SDK retries, and proxy model
+
+**What looked wrong.** `scripts/temperature_sweep.py` crashed mid-run with `ExceptionGroup` after Gemini returned **429 RESOURCE_EXHAUSTED** (5 RPM) and **503 UNAVAILABLE**. A single sweep attempt could trigger many underlying HTTP calls because the Google GenAI client’s default **tenacity** retries stacked on top of 9+ sweep calls.
+
+**Investigation.** Free tier for **`gemini-3.8-flash`** exposes both **5 RPM** and **20 requests/day per model** (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`). The first unpaced run burned the daily cap via retry storms. Pacing alone is insufficient if each “attempt” still performs ~5 SDK retries.
+
+**Root cause.** Missing **proactive spacing** (12.5s between call starts at 5 RPM) and missing **fail-soft** handling at the sweep layer; SDK default retries amplified quota usage.
+
+**Decision.**
+
+- Added `AsyncMinIntervalPacer` (`app/model_gateway/pacing.py`) and **`client_max_retries=0`** for eval scripts so one paced call equals one HTTP attempt.
+- Sweep catches quota/transient errors per attempt, records outcome codes, and **stops cleanly** on daily quota exhaustion (remaining arms marked `skipped_quota_exhausted`).
+- **Wall-clock with pacing:** at 5 RPM, interval ≈ **12.5s** between starts. **6 calls** (`--repeats 2`, 3 temperatures) ≈ **1.5–2.5 min**; **9 calls** (`--repeats 3`) ≈ **2.5–4 min** plus occasional 503/429 retry waits (65s RPM / 15s transient, at most once per attempt).
+
+**Measured results (2026-09-29):**
+
+| Model | Status | 0.0 | 0.2 | 1.0 | Notes |
+|-------|--------|-----|-----|-----|-------|
+| `gemini-3.8-flash` | Daily quota exhausted | — | — | — | Re-run after UTC day reset |
+| `gemini-3-flash-preview` | Proxy run, 9 calls, 130s | 2/3 valid | 3/3 | 3/3 | One 503 on 0.0 repeat 3 |
+
+**Provisional agent temperature:** **`0.2`** (`AGENT_LLM_TEMPERATURE`) — highest schema-validity rate on the proxy run; **confirm on `gemini-3.8-flash`** when daily quota resets (`evals/graph/temperature_sweep.json`). `gemini-3.5-flash-lite` ignores temperature (fixed sampling); not valid for this experiment.

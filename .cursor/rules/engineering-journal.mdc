@@ -1,0 +1,39 @@
+---
+description: Log diagnosed bugs and tradeoffs to docs/ENGINEERING_JOURNAL.md
+alwaysApply: true
+---
+
+# Engineering journal — when and how to log
+
+When a **real bug, environment constraint, or unexpected behavior** is investigated and resolved — not routine work — add a dated entry to [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md) **in the same task/commit where the fix is verified**, not as a later follow-up.
+
+## Qualifies for a journal entry
+
+- Root cause was unclear at first; multiple hypotheses were considered
+- Genuine tradeoff or engineering decision (e.g. hosted API vs local inference)
+- Environment/hardware limits that changed the approach
+- Misleading metrics or behavior that required diagnosis to explain
+
+## Do NOT log
+
+- Routine feature implementation with no surprises
+- Trivial typos, lint/formatting, version bumps, or config alignment
+- Changes that did not require genuine investigation
+
+**If uncertain whether something qualifies, ask the user before adding or skipping.**
+
+## Entry format
+
+Add a new `##` section (title = short problem name). Use the existing narrative structure:
+
+1. **What looked wrong.** — observable symptom
+2. **Investigation.** — what was tried or measured
+3. **Root cause.** — what actually caused it
+4. **Decision.** — what was chosen and why
+
+Keep each section concise. Write for a reviewer or interviewer (engineering judgment), not as a changelog bullet list. Link to tests, scripts, or config when they anchor the decision.
+
+## Timing
+
+- Update the journal **after** the fix is confirmed (tests pass, repro gone, or decision is final)
+- Include the journal update in the **same commit** as the fix when possible
