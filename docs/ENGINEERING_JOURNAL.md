@@ -211,3 +211,35 @@ Tests: `tests/unit/test_evidence_queries.py`, `tests/unit/test_budget.py`, `test
 - **Earlier live results** (`evals/graph/m4_sample_results*.json`) are kept unchanged. They were produced before these fixes, with fixture labels leaking into agent prompts and an ungrounded verifier, so they show that the graph runs end to end. They are not evidence of decision quality.
 
 Tests: `tests/unit/test_policy_gate.py`, `tests/unit/test_grounding.py`, `tests/unit/test_evidence_context.py`, `tests/unit/test_temperature_sweep_metrics.py`, `tests/graph/test_evidence_grounding.py`, `tests/graph/test_no_label_leakage.py`, `tests/graph/test_degradation_paths.py`, `tests/graph/test_interrupt_resume.py`, `tests/graph/test_test_strategist_context.py`.
+
+## M4 reliability: parallel branches overshot the call budget, and provider timeouts were never caught
+
+**What looked wrong.** Three problems turned up while preparing a controlled live run.
+
+1. With `ANALYSIS_MAX_LLM_CALLS=2` and four parallel agents, a probe made five LLM calls.
+2. A Triage Planner connection or timeout failure would abort the run instead of degrading it.
+3. The live-sample script did not record which policy override decided the outcome or why grounding rejected a judgment.
+
+**Investigation.**
+
+- *Budget.* `_generate` called `check_llm_call()`, awaited the provider, then called `record_llm_call()`. Branches suspended inside the provider call had all passed the check, so none had recorded anything yet. In the full offline graph, a fake LLM that holds every call until all four branches are inside it reproduces the overshoot: five calls against a limit of four, and two to five against limits of one to four. Tokens have the same shape, but token usage cannot be known before the response, so a strict token ceiling is not achievable.
+- *Retries.* LangGraph's default node `retry_on` retries any exception outside a short builtin list. A 429, a daily-quota error or a rejected API key on an LLM node would therefore re-run the node, making a second provider call against an exhausted quota.
+- *Triage.* `triage_planner_node` caught only budget and structured-output errors. A wider problem sits under it: the agent nodes' `ConnectionError`/`TimeoutError` handling never matched real provider failures. `openai.APIConnectionError`, `APITimeoutError`, `httpx.TransportError` and Gemini's `ServerError` all inherit from `Exception`, not from the builtin types, so in a live run a provider timeout in any agent escaped the degradation path. Only test doubles raising the builtin types were caught.
+
+**Decision.**
+
+- **Reserve, then settle.** `AnalysisBudget.reserve_llm_call()` checks capacity and increments an in-flight count with no `await` in between, under a lock. The reservation settles once, as `complete` (with usage) or `fail`. In-flight, completed and failed calls all count against `max_llm_calls`. A failed call is not refunded, because it may have reached the provider; that includes cancellation. A schema-invalid response now carries its token usage on `StructuredOutputError`, so it is counted too. Gateway transient retries (5xx only) stay inside one logical call, which bounds provider attempts at `max_llm_calls × (1 + transient_retries)`. A LangGraph node retry is a new logical call with its own reservation.
+- **Token semantics, stated plainly.** Token limits are checked at reservation time against settled usage. Once settled usage reaches a limit, no new call starts. The overshoot is bounded by the usage of calls already in flight, at most `max_parallel_agents`. A test pins this bound.
+- **Resume.** `TraceMetrics` gains `llm_calls_failed`, and `restore_counters` restores it and clears the in-flight count. Checkpoints fall between supersteps, so no call is in flight across a resume.
+- **Provider failures.** After its own retries, the gateway translates connection, timeout and 5xx failures into `ProviderUnavailableError`, a `ConnectionError` subclass, so every agent node's existing handling degrades the run to REVIEW. Quota, rate-limit and auth errors are never translated. They propagate as operational stops, and the node retry policy now skips them (`retry_node_on`).
+- **Triage.** `AGENT_FAILURES` raised by the Triage Planner now degrade the run: the default plan is recorded, no specialist runs, and the deterministic gate decides with a REVIEW floor, so a dependency BLOCK stays BLOCK. A schema-invalid plan still clamps to the default plan and continues. Unexpected exceptions still propagate.
+- **Instrumentation.** Each `scripts/run_m4_sample.py` row now records:
+  - `risk_score`, `override_applied` and `overrides_matched`;
+  - `grounding_rejections`, with reasons;
+  - `injection_evidence_ids`, the screened chunk IDs, and the verifier's injection flag;
+  - the retrieved chunk count and `approval_status`;
+  - `llm_calls_failed`, inside `trace_metrics`.
+
+  When verification did not run, coverage, assertion count and grounding fields are `null`, not zero. The default output is a new file, and the script refuses to overwrite an existing results file, so historical results cannot be replaced by accident.
+
+Tests: `tests/graph/test_budget_concurrency.py` (fails without the reservation), `tests/unit/test_budget.py`, `tests/graph/test_triage_failures.py`, `tests/unit/test_provider_errors.py`, `tests/graph/test_sample_result_summary.py`, `tests/graph/test_interrupt_resume.py`.

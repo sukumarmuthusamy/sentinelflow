@@ -113,6 +113,7 @@ def restore_counters(context: AnalysisGraphContext, values: dict[str, Any]) -> N
     for name in (
         "agent_steps",
         "llm_calls",
+        "llm_calls_failed",
         "mcp_tool_calls",
         "retrieval_queries",
         "input_tokens",
@@ -122,6 +123,9 @@ def restore_counters(context: AnalysisGraphContext, values: dict[str, Any]) -> N
     ):
         setattr(context.trace, name, int(trace.get(name) or 0))
     context.budget.llm_calls = context.trace.llm_calls
+    context.budget.llm_calls_failed = context.trace.llm_calls_failed
+    # Checkpoints are taken between supersteps, so nothing is in flight on resume.
+    context.budget.llm_calls_in_flight = 0
     context.budget.input_tokens = context.trace.input_tokens
     context.budget.output_tokens = context.trace.output_tokens
 

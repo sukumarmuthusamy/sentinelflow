@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import timedelta
 
 from langgraph.graph import END, START, StateGraph
@@ -28,12 +29,35 @@ from app.graph.nodes import (
     triage_planner_node,
 )
 from app.graph.typed_state import GraphState
+from app.model_gateway.errors import is_operational_stop_error
 
 
 def _approval_router(state: GraphState) -> str:
     if state.get("approval_status") == "approved":
         return "record_gate_decision"
     return "end"
+
+
+# The public RetryPolicy default (LangGraph's own retry rule), read without internals.
+_LANGGRAPH_DEFAULT_RETRY_ON = RetryPolicy().retry_on
+
+
+def retry_node_on(exc: Exception) -> bool:
+    """LangGraph's default retry rule, minus quota, rate-limit and auth errors.
+
+    The default retries any exception outside a short builtin list, so a 429 or a
+    rejected key on an LLM node would cost a second provider call. Each node retry
+    is a new logical LLM call and reserves its own budget; agent failures are handled
+    inside the nodes and never reach this policy.
+    """
+    if is_operational_stop_error(exc):
+        return False
+    default = _LANGGRAPH_DEFAULT_RETRY_ON
+    if isinstance(default, type):
+        return isinstance(exc, default)
+    if isinstance(default, Sequence):
+        return isinstance(exc, tuple(default))
+    return bool(default(exc))
 
 
 def build_analysis_graph(
@@ -43,7 +67,7 @@ def build_analysis_graph(
     cfg = settings or get_settings()
     graph = StateGraph(GraphState)
 
-    retry = RetryPolicy(max_attempts=2, initial_interval=0.5)
+    retry = RetryPolicy(max_attempts=2, initial_interval=0.5, retry_on=retry_node_on)
     timeout = timedelta(seconds=cfg.analysis_node_timeout_seconds)
 
     graph.add_node("intake_validator", intake_validator, retry_policy=retry)

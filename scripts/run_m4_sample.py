@@ -125,10 +125,34 @@ async def _run_one(row: dict[str, Any], *, llm: StructuredLLM) -> dict[str, Any]
                 "elapsed_seconds": round(time.monotonic() - started, 1),
             }
 
+    return summarize_result(
+        state,
+        request=request,
+        expected=_expected_decision(request),
+        interrupted=interrupted,
+        elapsed_seconds=round(time.monotonic() - started, 1),
+    )
+
+
+def summarize_result(
+    state: dict[str, Any],
+    *,
+    request: AnalysisRequest,
+    expected: str | None,
+    interrupted: bool,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    """One scenario's JSON row, read only from fields the graph actually wrote.
+
+    A value the run never produced is ``None``, not ``0`` or ``[]``: when verification
+    was skipped (degraded run) there is no coverage, no assertion count and no
+    grounding result, and reporting zeros would look like a measured clean result.
+    """
     total, invalid = _citation_validity(state)
-    metrics = state.get("verification_metrics") or {}
-    expected = _expected_decision(request)
-    decision = (state.get("risk_assessment") or {}).get("decision")
+    risk = state.get("risk_assessment")
+    metrics = state.get("verification_metrics")
+    plan = state.get("plan") or {}
+    decision = risk.get("decision") if risk else None
     return {
         "change_id": request.change_id,
         "domain_pack_id": request.domain_pack_id,
@@ -136,24 +160,42 @@ async def _run_one(row: dict[str, Any], *, llm: StructuredLLM) -> dict[str, Any]
         "decision": decision,
         "expected_decision": expected,
         "decision_matches_fixture": decision == expected if expected else None,
-        "plan_agents": (state.get("plan") or {}).get("agents"),
-        "plan_category": (state.get("plan") or {}).get("change_category"),
+        "risk_score": risk.get("risk_score") if risk else None,
+        # The override that set the final decision (None when the score alone did),
+        # and every policy condition that held, strictest first.
+        "override_applied": risk.get("override_applied") if risk else None,
+        "overrides_matched": list(risk.get("overrides_matched") or []) if risk else None,
+        "plan_agents": plan.get("agents"),
+        "plan_category": plan.get("change_category"),
         "agent_status": {
             row["agent"]: row["status"] for row in state.get("parallel_completions") or []
         },
+        "retrieved_chunk_count": len(state.get("retrieved_chunks") or []),
         "citations_in_final_state": total,
         "invalid_citations_after_filter": invalid,
         "invented_ids_before_filter": list(state.get("rejected_evidence_ids") or []),
-        "material_assertions": len(metrics.get("assertions") or []),
-        "evidence_coverage": metrics.get("evidence_coverage"),
-        "llm_reported_evidence_coverage": metrics.get("llm_reported_evidence_coverage"),
+        "verification_ran": metrics is not None,
+        "material_assertions": len(metrics.get("assertions") or []) if metrics else None,
+        "evidence_coverage": metrics.get("evidence_coverage") if metrics else None,
+        "llm_reported_evidence_coverage": (
+            metrics.get("llm_reported_evidence_coverage") if metrics else None
+        ),
+        # "supported" judgments demoted by the source-grounding check, with reasons
+        # (includes citations of chunks that were retrieved but not shown).
+        "grounding_rejections": (
+            list(metrics.get("grounding_rejections") or []) if metrics else None
+        ),
+        "verifier_injection_flagged": metrics.get("injection_flagged") if metrics else None,
+        # Retrieved chunks the deterministic screen flagged as instruction-like.
+        "injection_evidence_ids": list(state.get("injection_evidence_ids") or []),
         "repair_count": state.get("repair_count"),
-        "degraded_to_review": state.get("degraded_to_review"),
+        "degraded_to_review": bool(state.get("degraded_to_review")),
         "interrupt_paused_and_resumed": interrupted,
+        "approval_status": state.get("approval_status"),
         "record_decision_written": state.get("record_decision_written"),
         "trace_metrics": state.get("trace_metrics"),
-        "errors": state.get("errors"),
-        "elapsed_seconds": round(time.monotonic() - started, 1),
+        "errors": list(state.get("errors") or []),
+        "elapsed_seconds": elapsed_seconds,
     }
 
 
@@ -177,8 +219,20 @@ async def main() -> int:
         default=3,
         help="retries per call on 503/5xx only (waits 20s, 40s, 60s)",
     )
-    parser.add_argument("--out", type=Path, default=Path("evals/graph/m4_sample_results.json"))
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("evals/graph/m4_hardened_sample_results.json"),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="allow replacing an existing results file (historical results are kept)",
+    )
     args = parser.parse_args()
+    if args.out.exists() and not args.overwrite:
+        print(f"refusing to overwrite existing results file {args.out}", file=sys.stderr)
+        return 2
 
     # The graph reads models from Settings; overrides go through the env + cache reset.
     if args.agent_model:
@@ -225,6 +279,8 @@ async def main() -> int:
                         "status",
                         "decision",
                         "expected_decision",
+                        "override_applied",
+                        "grounding_rejections",
                         "invalid_citations_after_filter",
                         "invented_ids_before_filter",
                         "evidence_coverage",

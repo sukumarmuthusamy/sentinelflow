@@ -71,6 +71,8 @@ MIN_REMAINING_STEPS = 6
 # change itself. They degrade the run to REVIEW (never weakening BLOCK) instead of
 # aborting the superstep. Provider quota/auth errors are deliberately not here: an
 # exhausted API key is an infrastructure stop, not an analysis outcome.
+# Provider SDK transport errors reach this tuple as the gateway's
+# ProviderUnavailableError, a ConnectionError subclass.
 AGENT_FAILURES: tuple[type[Exception], ...] = (
     StructuredOutputError,
     McpToolError,
@@ -115,6 +117,7 @@ def _trace_update(ctx: AnalysisGraphContext) -> dict[str, Any]:
         "trace_metrics": TraceMetrics(
             agent_steps=ctx.trace.agent_steps,
             llm_calls=ctx.trace.llm_calls,
+            llm_calls_failed=ctx.trace.llm_calls_failed,
             mcp_tool_calls=ctx.trace.mcp_tool_calls,
             retrieval_queries=ctx.trace.retrieval_queries,
             input_tokens=ctx.trace.input_tokens,
@@ -217,6 +220,14 @@ async def triage_planner_node(state: GraphState, config: RunnableConfig) -> dict
             "errors": [f"triage plan invalid, clamped to default: {exc}"],
             **_trace_update(ctx),
         }
+    except AGENT_FAILURES as exc:
+        # Provider unreachable or timed out (or an MCP/validation failure): there is no
+        # plan worth trusting, so stop spending and let the deterministic gate decide
+        # with a REVIEW floor. Quota/auth errors are not in AGENT_FAILURES and still
+        # propagate as operational stops.
+        plan = default_plan_for_pack(ctx.domain_pack)
+        reason = f"triage_planner failed: {type(exc).__name__}: {str(exc)[:200]}"
+        return {"plan": plan.model_dump(mode="json"), **_degraded(reason), **_trace_update(ctx)}
     plan = validate_analysis_plan(proposed, ctx.domain_pack)
     try:
         # If triage itself spent the budget, stop here rather than fan out agents

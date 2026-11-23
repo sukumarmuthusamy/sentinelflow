@@ -37,7 +37,7 @@ from app.graph.injection import looks_like_injection
 from app.graph.state import AnalysisPlan, AnalysisRequest
 from app.graph.verification import MaterialAssertion, ground_report
 from app.mcp_client.port import McpClientPort
-from app.model_gateway.llm import StructuredLLM
+from app.model_gateway.llm import StructuredLLM, StructuredOutputError
 from app.rag.models import DocumentType, RetrievedChunk
 
 SECURITY_DOCUMENT_TYPES: frozenset[DocumentType] = frozenset(
@@ -90,19 +90,28 @@ async def _generate[T: BaseModel](
     user_prompt: str,
     schema: type[T],
 ) -> T:
-    """Single LLM call path: budget check, call, token accounting."""
-    budget.check_llm_call()
-    result = await llm.generate(
-        model=model,
-        temperature=temperature,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        schema=schema,
-    )
-    budget.record_llm_call(
-        input_tokens=result.input_tokens,
-        output_tokens=result.output_tokens,
-    )
+    """Single LLM call path: reserve budget, call, settle as completed or failed."""
+    reservation = budget.reserve_llm_call()
+    try:
+        result = await llm.generate(
+            model=model,
+            temperature=temperature,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema=schema,
+        )
+    except StructuredOutputError as exc:
+        # The provider answered (and billed tokens) but the output was unusable.
+        reservation.fail(input_tokens=exc.input_tokens, output_tokens=exc.output_tokens)
+        trace.bump_llm_failed(input_tokens=exc.input_tokens, output_tokens=exc.output_tokens)
+        raise
+    except BaseException:
+        # Includes cancellation: the request may have reached the provider, so the
+        # reserved call is consumed rather than refunded.
+        reservation.fail()
+        trace.bump_llm_failed()
+        raise
+    reservation.complete(input_tokens=result.input_tokens, output_tokens=result.output_tokens)
     trace.bump_llm(input_tokens=result.input_tokens, output_tokens=result.output_tokens)
     return result.value
 

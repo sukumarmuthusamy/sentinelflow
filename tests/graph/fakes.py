@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 from app.mcp_client.errors import McpToolError
@@ -138,3 +139,58 @@ class FailingToolMcp:
         if name == self._failing_tool:
             raise McpToolError(tool_name=name, message="simulated tool failure")
         return await self._inner.call_tool_typed(name, arguments, response_model=response_model)
+
+
+class GatedLLM(StaticStructuredLLM):
+    """Static LLM that holds each call until ``release_at`` calls are in flight.
+
+    Forces branches to overlap inside ``generate`` deterministically. Calls the
+    budget refuses never arrive, so the gate also opens after ``timeout`` seconds.
+    """
+
+    def __init__(
+        self,
+        responses: dict[type[BaseModel], BaseModel],
+        *,
+        release_at: int,
+        timeout: float = 0.5,
+    ) -> None:
+        super().__init__(responses)
+        self._release_at = release_at
+        self._timeout = timeout
+        self._gate = asyncio.Event()
+        self.in_flight = 0
+        self.peak = 0
+
+    async def generate(self, **kwargs: Any) -> LLMResult[Any]:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        if self.in_flight >= self._release_at:
+            self._gate.set()
+        try:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._gate.wait(), timeout=self._timeout)
+            return await super().generate(**kwargs)
+        finally:
+            self.in_flight -= 1
+
+
+class RaisingLLM(StaticStructuredLLM):
+    """Static LLM that raises a given exception for one schema."""
+
+    def __init__(
+        self,
+        responses: dict[type[BaseModel], BaseModel],
+        *,
+        schema: type[BaseModel],
+        error: BaseException,
+    ) -> None:
+        super().__init__(responses)
+        self._schema = schema
+        self._error = error
+
+    async def generate(self, **kwargs: Any) -> LLMResult[Any]:
+        if kwargs["schema"] is self._schema:
+            self.calls.append(f"{self._schema.__name__}!raised")
+            raise self._error
+        return await super().generate(**kwargs)

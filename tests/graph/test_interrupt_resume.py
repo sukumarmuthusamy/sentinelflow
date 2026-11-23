@@ -157,3 +157,29 @@ def test_restore_counters_carries_budget_across_resume() -> None:
 
     with pytest.raises(BudgetExhaustedError):
         context.budget.check_llm_call()
+
+
+def test_restore_counters_carries_failed_calls_and_clears_in_flight() -> None:
+    from app.graph.budget import AnalysisBudget, BudgetExhaustedError
+    from app.graph.context import AnalysisGraphContext
+    from app.graph.runner import restore_counters
+
+    budget = AnalysisBudget(
+        max_llm_calls=4,
+        max_input_tokens=10_000,
+        max_output_tokens=10_000,
+        max_parallel_agents=4,
+    )
+    budget.llm_calls_in_flight = 3  # a stale in-flight count must not survive resume
+    context = AnalysisGraphContext(
+        domain_pack=None,  # type: ignore[arg-type]
+        mcp=None,  # type: ignore[arg-type]
+        llm=None,  # type: ignore[arg-type]
+        budget=budget,
+    )
+    restore_counters(context, {"trace_metrics": {"llm_calls": 2, "llm_calls_failed": 1}})
+    assert context.trace.llm_calls_failed == 1
+    assert (budget.llm_calls, budget.llm_calls_failed, budget.llm_calls_in_flight) == (2, 1, 0)
+    budget.reserve_llm_call().complete()  # the fourth and last call
+    with pytest.raises(BudgetExhaustedError, match="max_llm_calls"):
+        budget.reserve_llm_call()

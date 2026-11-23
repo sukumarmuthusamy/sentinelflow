@@ -75,7 +75,9 @@ class TraceMetrics(BaseModel):
     """Observability metrics accumulated during an analysis run."""
 
     agent_steps: int = 0
+    # Completed LLM calls; calls that raised after reserving budget are counted apart.
     llm_calls: int = 0
+    llm_calls_failed: int = 0
     mcp_tool_calls: int = 0
     retrieval_queries: int = 0
     input_tokens: int = 0

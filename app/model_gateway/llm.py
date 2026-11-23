@@ -14,7 +14,11 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, ValidationError
 
 from app.core.settings import Settings, get_settings
-from app.model_gateway.errors import is_transient_api_error
+from app.model_gateway.errors import (
+    ProviderUnavailableError,
+    is_provider_unavailable_error,
+    is_transient_api_error,
+)
 from app.model_gateway.pacing import AsyncMinIntervalPacer
 
 T = TypeVar("T", bound=BaseModel)
@@ -23,7 +27,15 @@ logger = logging.getLogger(__name__)
 
 
 class StructuredOutputError(Exception):
-    """The provider responded, but the output did not validate against the schema."""
+    """The provider responded, but the output did not validate against the schema.
+
+    Carries the provider-reported usage so a failed call's tokens are still counted.
+    """
+
+    def __init__(self, message: str, *, input_tokens: int = 0, output_tokens: int = 0) -> None:
+        super().__init__(message)
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 @dataclass(frozen=True)
@@ -116,6 +128,9 @@ class _PacedStructuredLLM:
                 # Only provider overload (503/5xx) is retried here, with growing waits.
                 # 429s and daily-quota errors propagate: retrying them burns quota.
                 if attempt >= self._transient_retries or not is_transient_api_error(exc):
+                    if is_provider_unavailable_error(exc):
+                        msg = f"{model} unavailable: {type(exc).__name__}: {str(exc)[:200]}"
+                        raise ProviderUnavailableError(msg) from exc
                     raise
                 attempt += 1
                 wait = self._transient_backoff * attempt
@@ -136,12 +151,20 @@ class _PacedStructuredLLM:
         if parsed is None:
             error = result.get("parsing_error")
             msg = f"{schema.__name__} did not validate: {error}"
-            raise StructuredOutputError(msg)
+            raise StructuredOutputError(
+                msg,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
         try:
             value = parsed if isinstance(parsed, schema) else schema.model_validate(parsed)
         except ValidationError as exc:
             msg = f"{schema.__name__} did not validate: {exc}"
-            raise StructuredOutputError(msg) from exc
+            raise StructuredOutputError(
+                msg,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            ) from exc
         return LLMResult(value=value, input_tokens=input_tokens, output_tokens=output_tokens)
 
 
