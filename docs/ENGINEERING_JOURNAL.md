@@ -389,3 +389,34 @@ Evidence: `evals/github/m2_live_smoke_tools.json`.
 - *gitleaks configuration.* gitleaks gets an explicit default config and a trusted ignore path, PR files are staged one level below the target, and inline allow comments are ignored. Its default rule allowlists, such as the one for AWS `EXAMPLE` keys, are unchanged.
 
 Tests: `tests/contract/test_github_hardening.py`, `tests/unit/test_github_signal_tools.py`, and the scanner-failure and rename cases in `tests/graph/test_github_change_source.py`.
+
+## M5-A HTTP boundary: provider errors arrived wrapped, debug mode served tracebacks, and graph state was not safe to return
+
+**What looked wrong.** The first ASGI test of a provider quota stop expected `PROVIDER_RATE_LIMITED` and got `JOB_EXECUTION_FAILED`, logged as `ExceptionGroup`. Writing the rest of the error tests turned up four more ways the HTTP boundary would have misreported or leaked:
+
+- The M0 app passed `settings.debug` to FastAPI.
+- A `500` response had no `X-Request-ID` header.
+- Domain-pack loader errors carry local paths.
+- The graph's `errors` list embeds exception text.
+
+**Investigation.**
+
+- *ExceptionGroup.* `GraphExecutor` runs the graph inside the MCP adapter's `async with`. The adapter's anyio task group wraps any exception that crosses its exit in an `ExceptionGroup`, whose `str()` is "unhandled errors in a TaskGroup". Every classifier in `model_gateway/errors.py` reads `str(exc)` or attributes on the outer object, so a 429 and a rejected key would both have been reported as generic failures. `scripts/run_m4_sample.py` never hit this because its `try` sits *inside* the `async with`.
+- *Debug mode.* With `debug=True`, Starlette's `ServerErrorMiddleware` answers an unhandled exception with an HTML traceback before any registered handler runs. A `.env` with `DEBUG=true` would have published tracebacks over the API.
+- *Request ID.* That same outermost middleware sends the `500`, so a header added by user middleware never reaches it.
+- *Loader details.* `load_domain_pack` puts the pack directory path and the YAML parser's message in `details`.
+- *Graph errors.* Agent failures are recorded as `"<agent> failed: <Type>: <message[:200]>"`, and provider messages can include request URLs.
+- *Approval payload.* The approval node coerces its payload with `bool(...)`, so a string `"false"` would approve.
+
+**Root cause.** M4's interfaces were written for trusted in-process callers. Exception text, loader details and loose payload coercion were harmless there, and become a leak or a bypass once HTTP clients sit on the other side.
+
+**Decision.**
+
+- *Classifying failures.* `classify_failure` unwraps exception groups to the first leaf before classifying. MCP and change-source types are matched before any status-code check, because an MCP error's `code` is a JSON-RPC code, not HTTP.
+- *Error responses.* The API never enables debug mode. Error responses set `X-Request-ID` themselves, and the error envelope passes only allowlisted detail keys. Pack errors are re-raised with only the pack ID.
+- *Degradation.* Graph errors become `DegradationReason` codes. Deterministic gap text is kept (truncated, control characters stripped), because the deterministic layer writes it itself.
+- *Approval.* The approval body is strict at the API: `StrictBool`, extra fields forbidden, and no decision field. Only `{"approved": bool}` reaches the graph. The M4 node is unchanged.
+
+Also caught by an existing guard: the domain-vocabulary leak test flagged the word "claim", used for "claiming a job", in `app/jobs` and `app/persistence`. The wording is now "acquire" and "reserve".
+
+Tests: `tests/api/test_errors_and_security.py` and `tests/api/test_approval.py`.

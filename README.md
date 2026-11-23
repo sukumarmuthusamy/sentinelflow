@@ -11,9 +11,10 @@ SentinelFlow ingests a proposed software change and produces an **evidence-cited
 | **M2** | Complete | `sentinelflow-context` MCP server (7 tools, 3 resources), typed client adapter, read-only GitHub PR change source behind the same tools |
 | **M3** | Complete | Hybrid RAG, pgvector + Qdrant adapters, Gemini embeddings, reranker ablation (none vs Voyage), eval harness |
 | **M4** | Complete (merged in #1) | LangGraph workflow, five agents, triage planner, checkpoint + approval interrupt. A post-hardening live check ran on an OpenRouter stand-in model across 4 fixtures: both expected BLOCKs held, the 2 expected PASS fixtures returned REVIEW, and 0 invalid citations survived. Evidence coverage was 0% on the templated corpus. The primary Gemini model is not yet evaluated |
+| **M5** | In progress (M5-A on branch) | M5-A: versioned HTTP API with durable jobs, `Idempotency-Key`, approval resume over HTTP, an evaluation trigger and machine-readable errors. SSE streaming (M5-B) and the Streamlit harness (M5-C) are not started |
 
 Canonical architecture and roadmap: [SENTINELFLOW_PLAN.md](SENTINELFLOW_PLAN.md).  
-Real obstacles and tradeoffs from M0–M4: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
+Real obstacles and tradeoffs from M0–M5: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
 
 ---
 
@@ -89,7 +90,7 @@ uv run pytest
 ### 4. Run the API (M0+)
 
 ```bash
-uv run uvicorn app.main:app --reload
+uv run python -m app.api.serve          # 127.0.0.1:8000, one worker (see M5)
 ```
 
 ---
@@ -323,3 +324,38 @@ Callable from Python (no HTTP yet): `app/graph/` wires intake → deterministic 
 - **Tests:** `tests/graph/` runs the full graph offline (static LLM, in-memory MCP, fake retriever): interrupt/resume and exactly-once audit writes, evidence grounding, label leakage, degradation paths
 
 See [SENTINELFLOW_PLAN.md § M4](SENTINELFLOW_PLAN.md) for exit criteria.
+
+---
+
+## M5 — HTTP API (M5-A: contracts and job lifecycle)
+
+A local development harness, not a public service. The design, guarantees and limits are in [ADR-0003](docs/adr/0003-api-job-lifecycle.md).
+
+**Run.** `uv run python -m app.api.serve` binds `127.0.0.1:8000` with one worker. Without `API_KEY`, `/v1` answers loopback clients only. With it, every request needs `Authorization: Bearer <key>`, and `--host` may be non-loopback. OpenAPI docs are at `/docs`. **A `POST /v1/analyses` runs the real graph and spends provider quota.** It needs `GEMINI_API_KEY`, plus `OPENROUTER_API_KEY` for `vendor/model` IDs, and pgvector for retrieval. Without them the request is refused with `503 PROVIDER_NOT_CONFIGURED` before a job is created.
+
+| Method and path | Purpose |
+|---|---|
+| `POST /v1/analyses` | Start an analysis. Body `{change_id, domain_pack_id, objective?, execute_tests?, record_decision?, source?}`. Returns `202` and `Location`. Optional `Idempotency-Key` |
+| `GET /v1/analyses/{job_id}` | Job status: `queued`, `running`, `waiting_for_approval`, `completed` or `failed` |
+| `GET /v1/analyses/{job_id}/decision` | Risk assessment, cited report, plan, degradation codes, approval state and trace. Available while waiting for approval and after completion; `409 RESULT_NOT_AVAILABLE` before that |
+| `POST /v1/analyses/{job_id}/approval` | `{approved, reviewer, comment?}` (strict). Resumes the original LangGraph thread. Accepted once only |
+| `POST /v1/evaluations` | `{suite: "deterministic_fixtures", domain_pack_ids?}`. Runs the M1 fixture evaluation offline. Optional `Idempotency-Key` |
+| `GET /v1/evaluations/{job_id}` and `.../result` | Evaluation status and per-fixture rows with a summary |
+
+**Semantics.**
+
+- **Replays and conflicts.** The same `Idempotency-Key` with the same validated body returns the original job (`200`, `Idempotent-Replayed: true`), even if that job failed. The same key with a different body is `409 IDEMPOTENCY_KEY_CONFLICT`.
+- **REVIEW is not a failure.** A REVIEW outcome, including a degraded run, is a `completed` job. `failed` means execution stopped: provider quota or auth, MCP, the change source, or an interrupted process.
+- **Restarts.** A `running` job found at startup is marked `JOB_INTERRUPTED` and is not re-run. Queued jobs are relaunched, and jobs waiting for approval stay resumable.
+- **Errors.** Every error is `{"error": {code, message, details, request_id}}`.
+
+**Example.**
+
+```bash
+curl -s -X POST localhost:8000/v1/evaluations -H 'Idempotency-Key: eval-1' -H 'content-type: application/json' -d '{}'
+curl -s localhost:8000/v1/evaluations/<job_id>/result
+```
+
+**Tests.** `tests/api/` drives the ASGI app over HTTP with a static LLM, the in-process MCP server on fixtures and a fake retriever. No test makes a provider or network call.
+
+**Not yet.** `node.*` and `agent.token` events are defined in `app/jobs/events.py` but not emitted (M5-B). There is no Streamlit UI yet (M5-C).
