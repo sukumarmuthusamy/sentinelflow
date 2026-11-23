@@ -10,11 +10,13 @@ from app.deterministic.models import (
     BlastRadiusNode,
     BlastRadiusResult,
     ContractDiffResult,
+    DeterministicSignals,
     SecurityFindingRecord,
     SecurityScanResult,
 )
 from app.deterministic.risk_engine import (
     blast_radius_norm,
+    compute_risk_score,
     contract_break_norm,
     critical_service_norm,
     evidence_confidence_norm,
@@ -131,3 +133,35 @@ class TestEvidenceConfidenceNorm:
 
     def test_mid_when_partially_unsupported(self) -> None:
         assert evidence_confidence_norm(unsupported_assertion_rate=0.4) == 0.4
+
+
+class TestEvidencePenaltySign:
+    """Weak evidence must raise risk, never lower it."""
+
+    @staticmethod
+    def _signals(rate: float | None) -> DeterministicSignals:
+        return DeterministicSignals(
+            change_id="CHG-T",
+            primary_service="svc-core-api",
+            impacted_services=["svc-core-api"],
+            contract_diff=ContractDiffResult(warn_count=1),
+            unsupported_assertion_rate=rate,
+        )
+
+    def test_unsupported_assertions_raise_score(self, healthcare_pack: DomainPack) -> None:
+        clean = compute_risk_score(self._signals(0.0), healthcare_pack)
+        weak = compute_risk_score(self._signals(1.0), healthcare_pack)
+        assert weak.risk_score > clean.risk_score
+        assert weak.weighted_components["evidence_confidence_penalty"] > 0
+
+    def test_score_monotonic_in_unsupported_rate(self, healthcare_pack: DomainPack) -> None:
+        scores = [
+            compute_risk_score(self._signals(rate), healthcare_pack).risk_score
+            for rate in (0.0, 0.25, 0.5, 1.0)
+        ]
+        assert scores == sorted(scores)
+
+    def test_explicit_rate_overrides_boolean_fallback(self, healthcare_pack: DomainPack) -> None:
+        signals = self._signals(0.25).model_copy(update={"critical_claims_unsupported": True})
+        norms = compute_risk_score(signals, healthcare_pack).norms
+        assert norms.evidence_confidence_norm == pytest.approx(0.25)

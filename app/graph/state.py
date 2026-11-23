@@ -51,8 +51,10 @@ class AnalysisPlan(BaseModel):
     change_category: ChangeCategory
     agents: list[AgentName] = Field(min_length=1)
     rationale: str = Field(
-        max_length=500,
-        description="Short classification rationale; not a free-form reasoning trace",
+        description=(
+            "Short classification rationale (truncated to 500 characters by plan "
+            "validation); not a free-form reasoning trace"
+        ),
     )
     clamped_to_default: bool = False
 
@@ -64,6 +66,8 @@ class RiskAssessment(BaseModel):
     decision: ReleaseDecision
     confidence: float = Field(ge=0.0, le=1.0)
     override_applied: str | None = None
+    # Every policy condition that held, strictest first, for the audit trail.
+    overrides_matched: list[str] = Field(default_factory=list)
     component_scores: dict[str, float] = Field(default_factory=dict)
 
 
@@ -71,13 +75,16 @@ class TraceMetrics(BaseModel):
     """Observability metrics accumulated during an analysis run."""
 
     agent_steps: int = 0
+    # Completed LLM calls; calls that raised after reserving budget are counted apart.
     llm_calls: int = 0
+    llm_calls_failed: int = 0
     mcp_tool_calls: int = 0
     retrieval_queries: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     estimated_cost_usd: float = 0.0
     repair_count: int = 0
+    citations_rejected: int = 0
 
 
 class CriticalFinding(BaseModel):
@@ -97,7 +104,12 @@ class ReleaseReport(BaseModel):
     impacted_services: list[str] = Field(default_factory=list)
     critical_findings: list[CriticalFinding] = Field(default_factory=list)
     recommended_tests: list[str] = Field(default_factory=list)
-    evidence_coverage: float = Field(ge=0.0, le=1.0)
+    evidence_coverage: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Computed by code from validated citations; None when nothing to verify",
+    )
     requires_human_approval: bool = False
 
 

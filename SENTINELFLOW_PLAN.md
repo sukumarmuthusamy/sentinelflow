@@ -124,9 +124,11 @@ RiskScore = clamp(0, 100,
   + 15 * security_severity_norm    # max severity and count from gitleaks / semgrep / osv-scanner
   + 15 * test_gap_norm             # required-but-absent tests vs. the repo test inventory
   +  10 * incident_similarity_norm # retrieval similarity to prior incidents, deterministic over scores
-  -  10 * evidence_confidence_norm # penalty: unsupported-claim rate from the Evidence Verifier
+  +  10 * evidence_confidence_norm # penalty: unsupported-assertion rate, computed in code
 )
 ```
+
+**Correction (M4 review):** this term was originally written with a minus sign, which made more unsupported assertions *lower* the score. It is added: weak evidence can only raise risk, and agent output never lowers a deterministic score. The rate is computed in code from the Evidence Verifier's per-assertion judgments, not taken from the verifier's self-reported numbers. See docs/ENGINEERING_JOURNAL.md.
 
 Every `_norm` term is a documented function with its own unit tests and a defined range of `[0, 1]`. The weights come from the architecture doc's priors but are **calibrated, not asserted**: a grid search over the golden set maximizes decision accuracy, and the plan reports pre- and post-calibration accuracy so the calibration is itself an artifact rather than a claim.
 

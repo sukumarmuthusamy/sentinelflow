@@ -118,6 +118,7 @@ class DeterministicSignals(BaseModel):
     required_tests: list[str] = Field(default_factory=list)
     available_tests: list[str] = Field(default_factory=list)
     evidence_coverage: float | None = None
+    unsupported_assertion_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     critical_claims_unsupported: bool = False
     repair_attempted: bool = False
 
@@ -149,5 +150,7 @@ class PolicyGateResult(BaseModel):
     risk_score: int = Field(ge=0, le=100)
     override_applied: str | None = None
     override_condition: str | None = None
+    # Every override whose condition held, strictest first (audit trail).
+    overrides_matched: list[str] = Field(default_factory=list)
     score_decision: ReleaseDecision
     norms: NormBreakdown

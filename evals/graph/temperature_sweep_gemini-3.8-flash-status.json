@@ -1,0 +1,9 @@
+{
+  "model": "gemini-3.8-flash",
+  "status": "daily_quota_exhausted",
+  "date_utc": "2026-09-30",
+  "quota_hint": "GenerateRequestsPerDayPerProjectPerModel-FreeTier quotaValue 20",
+  "action": "Re-run: uv run python scripts/temperature_sweep.py --repeats 3 --model gemini-3.8-flash",
+  "proxy_results_file": "evals/graph/temperature_sweep.json",
+  "proxy_model": "gemini-3-flash-preview"
+}

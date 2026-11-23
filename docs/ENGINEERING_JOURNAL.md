@@ -1,4 +1,4 @@
-# Engineering Journal (M0–M3)
+# Engineering Journal (M0–M4)
 
 Technical notes on problems that looked like bugs, tooling failures, or “too good to be true” metrics — and the judgments that followed. For architecture and roadmap, see [SENTINELFLOW_PLAN.md](../SENTINELFLOW_PLAN.md).
 
@@ -66,3 +66,242 @@ Extrapolated: ~17 hours for the local arm of the full ablation alone (71 queries
 **Decision.** Document local reranking as **CPU-only, optional, and excluded from eval sweeps on constrained hardware** (`--skip-local-reranker`). Operational ablation: **none vs Voyage** (`rerank-2.5-lite`). Measured outcome: recall@10 stayed at 1.00 on all arms; Voyage improved MRR/nDCG on hard batches (e.g. ecommerce hard MRR 0.93 → 0.96). See [README M3 section](../README.md#m3--retrieval) and `evals/retrieval/reports/latest.json` for full numbers.
 
 This is an explicit engineering tradeoff: **hosted reranking for evaluation velocity and reproducibility on dev laptops**, with local cross-encoders retained for environments that have the RAM and CPU/GPU to run them.
+
+---
+
+## M4 temperature sweep: free-tier pacing, SDK retries, and proxy model
+
+**What looked wrong.** `scripts/temperature_sweep.py` crashed mid-run with `ExceptionGroup` after Gemini returned **429 RESOURCE_EXHAUSTED** (5 RPM) and **503 UNAVAILABLE**. A single sweep attempt could trigger many underlying HTTP calls because the Google GenAI client’s default **tenacity** retries stacked on top of 9+ sweep calls.
+
+**Investigation.** Free tier for **`gemini-3.8-flash`** exposes both **5 RPM** and **20 requests/day per model** (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`). The first unpaced run burned the daily cap via retry storms. Pacing alone is insufficient if each “attempt” still performs ~5 SDK retries.
+
+**Root cause.** Missing **proactive spacing** (12.5s between call starts at 5 RPM) and missing **fail-soft** handling at the sweep layer; SDK default retries amplified quota usage.
+
+**Decision.**
+
+- Added `AsyncMinIntervalPacer` (`app/model_gateway/pacing.py`) and **`client_max_retries=0`** for eval scripts so one paced call equals one HTTP attempt.
+- Sweep catches quota/transient errors per attempt, records outcome codes, and **stops cleanly** on daily quota exhaustion (remaining arms marked `skipped_quota_exhausted`).
+- **Wall-clock with pacing:** at 5 RPM, interval ≈ **12.5s** between starts. **6 calls** (`--repeats 2`, 3 temperatures) ≈ **1.5–2.5 min**; **9 calls** (`--repeats 3`) ≈ **2.5–4 min** plus occasional 503/429 retry waits (65s RPM / 15s transient, at most once per attempt).
+
+**Measured results (2026-09-29):**
+
+| Model | Status | 0.0 | 0.2 | 1.0 | Notes |
+|-------|--------|-----|-----|-----|-------|
+| `gemini-3.8-flash` | Daily quota exhausted | — | — | — | Re-run after UTC day reset |
+| `gemini-3-flash-preview` | Proxy run, 9 calls, 130s | 2/3 valid | 3/3 | 3/3 | One 503 on 0.0 repeat 3 |
+
+**Provisional agent temperature:** **`0.2`** (`AGENT_LLM_TEMPERATURE`) — highest schema-validity rate on the proxy run; **confirm on `gemini-3.8-flash`** when daily quota resets (`evals/graph/temperature_sweep.json`). `gemini-3.5-flash-lite` ignores temperature (fixed sampling); not valid for this experiment.
+
+---
+
+## M4 review: the LLM was scoring its own evidence, and weak evidence lowered risk
+
+**What looked wrong.** A code review of the M4 graph (before any live run) traced how the Evidence Verifier's output reached the gate. Two things contradicted the project's thesis that code, not the model, computes the verdict: (1) `evidence_coverage` and `unsupported_assertion_rate` were read straight from the verifier's own `VerificationReport`, and those numbers drove both the coverage-floor `REVIEW` override and the risk score; (2) more unsupported assertions produced a *lower* risk score.
+
+**Investigation.** For (1), the verifier is an LLM; nothing checked that its reported coverage matched its own per-assertion judgments. A report claiming `evidence_coverage=1.0` with zero assessments sailed past the floor. For (2), `apply_weights` applied `-weight * evidence_confidence_norm`, and `evidence_confidence_norm` *is* the unsupported rate. The sign was inherited from plan section 4's formula (`- 10 * evidence_confidence_norm # penalty: unsupported-claim rate`), which reads as a discount but was fed a penalty input. The `REVIEW` override masked it only when a repair had already happened. All eight M1 fixtures were re-run after the fix to confirm no verdict changed.
+
+**Root cause.** (1) The LLM's summary statistics crossed the deterministic boundary unchecked. (2) A term named "confidence" carried an "unsupported" quantity, and the sign followed the name rather than the value.
+
+**Decision.**
+
+- Coverage, unsupported rate and the critical-unsupported flag are computed in code (`app/graph/verification.py`) from the per-assertion judgments, after invalid evidence IDs are stripped. An assertion counts as supported only if the verifier assessed it by its exact ID as `supported` with at least one surviving citation. Skipped assertions count as unsupported. The verifier's self-reported numbers are kept as `llm_reported_*` for comparison in M6, never as gate inputs.
+- Material assertions are the Change Analyst's hypotheses and the Security Auditor's findings, namespaced `hyp:` / `sec:`. With none, coverage is `None` (floor not applied), unless deterministic signals show a contract break or scanner finding, in which case it is `0.0`.
+- The penalty term is now added. Agent output can only make the gate stricter, never lower a deterministic score. Plan section 4 is updated to match.
+- Known limit: an agent that emits no assertions on a change with clean deterministic signals gets `None` coverage. That is acceptable because the verdict is then fully deterministic, but M6 should measure how often it happens.
+
+Tests: `tests/unit/test_verification_metrics.py`, `tests/unit/test_risk_engine.py::TestEvidencePenaltySign`, `tests/graph/test_gate_integrity.py::test_verifier_self_reported_coverage_is_ignored`.
+
+---
+
+## M4 review: parallel fan-out starved the Evidence Investigator of change context
+
+**What looked wrong.** The Evidence Investigator was meant to retrieve evidence for the Change Analyst's hypotheses, but the hypotheses list was always empty, so every change retrieved the same documents with the same query: the fixed `request.objective` string.
+
+**Investigation.** `Send` fan-out copies graph state at dispatch time. The Change Analyst and Evidence Investigator run in the *same* superstep, so `state["change_impact"]` is always `None` when the investigator starts. Tracing further turned up three related wiring faults: the Security Auditor queried with the change ID (`"... CHG-H001"`), which means nothing to an embedding model; its retrieved evidence IDs never reached `retrieved_evidence_ids`, so the verifier stripped its valid citations; and the repair loop (a) queried with opaque assertion IDs rather than their text and (b) intersected newly retrieved IDs with the *old* set, discarding exactly the new evidence repair exists to find.
+
+**Root cause.** The topology (parallel specialists, plan section 2) and the data dependency (investigator needs hypotheses) disagreed, and the fallback hid it.
+
+**Decision.** Keep the parallel topology and source queries from the deterministic signal layer, which exists before fan-out and is specific to each change: primary service, contract-diff messages, scanner findings, downstream services, prior incidents (`app/agents/queries.py`). The Security Auditor's query uses scanner findings, and its IDs merge into `retrieved_evidence_ids`. Repair queries with the text of unsupported assertions and unions new IDs with old ones. Making the investigator wait for the Change Analyst was rejected: it serializes the slowest two agents and still would not help the Security Auditor. Prompts bumped to `v2` (v1 is kept so the earlier sweep stays reproducible).
+
+Related fixes in the same pass: budget exhaustion inside an agent now degrades to `REVIEW` instead of raising through `RetryPolicy`, and degradation never weakens a deterministic `BLOCK`; token usage is captured from the provider (`include_raw=True`) so the token budget is real; citations stripped by the evidence-ID validator are recorded (`rejected_evidence_ids`) so "zero invented IDs" is measurable; the policy's `category_agent_map` is enforced as a floor on the triage plan.
+
+Tests: `tests/unit/test_evidence_queries.py`, `tests/unit/test_budget.py`, `tests/graph/test_gate_integrity.py`.
+
+---
+
+## M4 live run: 503s spend the daily quota, and 20 requests/day cannot fit the sample
+
+**What looked wrong.** The first live trajectory (2026-11-22, new AI Studio project) failed on `503 UNAVAILABLE` ("model is currently experiencing high demand") from `gemini-3.8-flash`. A second attempt with transient retries saw only 503s, and then the model returned `429` with "requests per day limit exceeded on Free Tier, limit: 20", retry in about 7.5 hours.
+
+**Investigation.** A one-request probe per model showed `gemini-3-flash-preview`, `gemini-3.5-flash` and `gemini-3.5-flash-lite` answering normally while `gemini-3.8-flash` was out of daily quota, after about 20 attempts that were nearly all 503s. So 503 responses count toward the daily cap. Separately, a single trajectory costs 5–7 generation calls (four specialists, verifier, plus one repair and a re-verify when coverage is low). The five-scenario sample needs about 30 calls, more than the 20/day cap even with zero failures. Two code faults surfaced: one 503 in one parallel branch failed the whole graph (LangGraph's node `RetryPolicy` retried after 0.5 s, too soon for an overload), and `is_daily_quota_exhausted` did not recognise the November error wording, so the sample would have kept burning requests after the cap.
+
+**Root cause.** Free-tier capacity, not a project bug. It is made worse by retries that spend quota on an overloaded model.
+
+**Decision.**
+
+- `GeminiStructuredLLM` takes a shared `pacer` (all parallel agents queue behind one 5 RPM limit) and `transient_retries` with growing waits (20 s, 40 s, …) for 503/5xx only. 429s and daily-quota errors fail fast.
+- The quota classifier handles both wordings (`tests/unit/test_provider_errors.py`), and `run_m4_sample.py` stops at the first daily-quota error.
+- On this tier the primary model cannot carry the full sample in one day. Live validation ran one trajectory on `gemini-3-flash-preview` as a stand-in for the agents: it completed in 98 s with 7 calls, 0 invented evidence IDs and 0 invalid citations. The verifier *contradicted* the Change Analyst's "zero functional risk" hypothesis for the docs-only change CHG-H001, citing three policy and ownership chunks. Computed coverage was 0.0 against a self-reported 1.0, so the gate returned REVIEW where the fixture label says PASS. That is a real disagreement between agents, which the self-reported number would have hidden. Whether the label or the policy corpus is right is an M6 calibration question.
+- The same run showed the Triage Planner classifying that change as `unknown`. It only saw the change ID and service names. It now gets changed file paths and a deterministic-signal summary, but never the fixture's `category`, `description` or `expected_decision`, which are ground truth for plan-selection accuracy (`tests/unit/test_triage_input.py`).
+
+---
+
+## M4 live sample on OpenRouter: resume zeroed the trace, and one scenario sits on the evidence floor
+
+**What looked wrong.** With Gemini's free tier unable to carry the sample, the agents moved to an OpenRouter free model and the first full five-scenario run (2026-11-22) passed cleanly, except that CHG-E002, the one scenario that pauses for approval and resumes, reported `llm_calls: 0` and zero tokens after a full analysis. A second run then returned REVIEW for CHG-H001, which the first run had passed.
+
+**Investigation.**
+
+- *Model choice.* OpenRouter lists five free models with strict `structured_outputs`; the 1.7B one was skipped as too small for the agent prompts. One probe call each to the other four with a small cited-evidence schema: `nvidia/nemotron-3.5-super-vl:free` (4.6 s, cited only the two IDs offered) and `baidu/ernie-5.5-flash-preview:free` (5.0 s, same) passed; `inclusionai/ling-3.2-flash:free` returned a sentence in the evidence-ID field; `particle-ai/particle-1:free` was rate-limited (429). Nemotron became the agent model; the Triage Planner stayed on `gemini-3.5-flash-lite`. The gateway routes by model ID: any `vendor/model` slug goes to OpenRouter, each provider behind its own pacer.
+- *Zeroed trace.* `resume_analysis` rebuilds `AnalysisGraphContext`, and with it a fresh `TraceAccumulator` and `AnalysisBudget`. The post-interrupt node (`record_gate_decision`) emits `_trace_update(ctx)` from that empty accumulator, overwriting the checkpointed metrics. The budget had the same fault: a resumed run would restart its call and token counters, so the cap could in principle be exceeded across an interrupt.
+- *CHG-H001 flip.* The domain pack's `evidence_floor` is 0.75. Run 1 computed coverage 0.75 (3 of 4 assertions supported, not below the floor) → PASS; run 2 computed 0.6 (3 of 5) → REVIEW via `weak-evidence`. Same model, same temperature (0.2). With four or five material assertions, one verifier judgment moves coverage by 0.2–0.25.
+
+**Root cause.** The resume path restored graph state but not the runtime counters that live outside it. The H001 flip is not a bug: it is sampling variance on a change whose coverage sits exactly at the policy floor, made coarse by small assertion counts.
+
+> **Correction (M4 hardening, next entry).** The H001 diagnosis above was incomplete. Checkpoint inspection showed the fixture manifest's synthetic `evidence_coverage: 0.9` reaching the Change Analyst's prompt in both runs, which then emitted a "10% of evidence is uncovered" hypothesis that the verifier contradicted. Fixture labels leaking into agent input was a driver of the flip, not only sampling variance.
+
+**Decision.**
+
+- `runner.restore_counters` seeds the trace and budget from the checkpointed `trace_metrics` before resuming. `tests/graph/test_interrupt_resume.py` now asserts the trace survives resume; it failed (`0 == 5`) before the fix. Run 1's results are kept as `evals/graph/m4_sample_results_run1.json`, with its CHG-E002 trace known-wrong; run 2 (`m4_sample_results.json`) is after the fix.
+- Results over both runs (10 trajectories): **0 invalid citations and 0 invented evidence IDs** in every trajectory; 9/10 decisions matched the fixture label (the miss is H001 in run 2); approval paused and resumed on the same thread with exactly one audit-log write. Computed coverage was below the verifier's self-reported number in 7 of 10 trajectories (for example 0.6 against 1.0 on CHG-H002), equal in 2 and above in 1. Each trajectory took 6–8 calls and 15–39k input tokens.
+- Temperature sweep on Nemotron, Change Analyst schema, three repeats each: 0.0, 0.2 and 1.0 were all 3/3 schema-valid (`evals/graph/temperature_sweep_nemotron.json`). Schema validity does not discriminate on this model, so the script's tie-break pick of 0.0 carries no information. `AGENT_LLM_TEMPERATURE` stays at **0.2**, the value under which both full samples met the citation criteria. Separating temperatures needs a decision-stability metric over repeated full trajectories, which is M6 work.
+- The gate is unchanged. Whether H001's floor-straddling coverage should be handled by more assertions, a calibrated floor, or repeated sampling is an M6 calibration question; widening the floor to make this sample pass would be fitting the policy to one run.
+- Not measured: `gemini-3.8-flash`, the planned primary model, which was out of daily quota for the whole session. The default `AGENT_LLM_MODEL` is unchanged; the OpenRouter model is passed per run with `--agent-model`.
+
+---
+
+## M4 hardening: BLOCK could be downgraded, the verifier never read its evidence, and fixture labels reached agents
+
+**What looked wrong.** A review of the M4 branch, done before merging, found three gate-integrity defects. None of them showed up in the ten live trajectories, because those scenarios happened to avoid the code paths involved.
+
+1. CHG-E003 (a high-severity dependency vulnerability, expected BLOCK) returned REVIEW once evidence coverage fell below the floor.
+2. The Evidence Verifier's checkpointed notes echoed the Evidence Investigator's labels ("q0 evidence carries a support stance") instead of quoting documents. It also marked hypotheses `supported` while citing chunks that do not mention them.
+3. Change Analyst hypotheses quoted numbers that exist only in fixture manifests ("10% lacks coverage" from `evidence_coverage: 0.9`).
+
+**Investigation.**
+
+- *Gate.* `apply_policy_gate` returned on the first matching override in `policy.yaml` order. Both packs list `weak-evidence` and `unsupported-critical-claim` (REVIEW) above `dependency-vuln-ceiling` (BLOCK). Offline, CHG-E003 goes from BLOCK to REVIEW at coverage 0.5, and to REVIEW again with an unsupported critical assertion after repair. A score above `review_max` (for example 86) with weak evidence also returned REVIEW. In the live sample every BLOCK came from `critical-contract-break` or `secret-exposure`, which are listed first, so no committed result was affected.
+- *Verifier input.* `evidence_verifier_node` sent the specialists' structured outputs and the list of allowed IDs, never chunk text. The Security Auditor's chunks were not stored at all. `retrieved_chunks` was typed as a single dict with no reducer, so a second parallel writer would have raised a concurrent-update error. Citation validity was 100% only in the sense that the IDs existed.
+- *Leakage.* `build_signals_from_fixture` copies three manifest fields into the runtime signals: `evidence_coverage`, `repair_attempted` and `critical_claims_unsupported`. They are synthetic stand-ins that the M1 deterministic tests need. The fields reached the Change Analyst's prompt. They also reached scoring: when no verification metrics existed, the risk engine kept the stub coverage, and `compute_norms` turned the stub `critical_claims_unsupported=True` into an unsupported rate of 1.0. Separately, `get_change_package` returned the manifest `description` and `category`, which are evaluator notes that state the answer ("Critical claim remains unsupported after the single repair attempt").
+
+**Root cause.** Three separate gaps. Gate precedence depended on file order. The verifier was handed interpretations instead of sources. And the fixture manifest serves both as runtime input and as the answer key, with nothing separating the two.
+
+**Decision.**
+
+- **Gate.** Every override is evaluated. The final decision is the strictest of the score decision and all matched outcomes (PASS < REVIEW < BLOCK). Equal-severity ties break by override id, so permuting `policy.yaml` cannot change the result (a test checks all 120 orderings). `override_applied` names the override that set the decision. The new `overrides_matched` field keeps every reason for the audit trail. `policy.yaml` is not reordered; the fix does not depend on order. Degradation and the injection floor use the same `strictest_decision` helper.
+- **Verifier grounding.** Chunks from the Investigator, the Security Auditor and repair merge into `retrieved_chunks`, deduplicated by evidence ID and sorted, so branch completion order does not matter. The verifier gets a bounded view: up to 40 chunks, 1,500 characters each, 40,000 in total, with specialist-cited chunks first. It can cite only chunks it was shown. It does not get the Investigator's stance labels. A `supported` judgment survives only if its new `supporting_quote` passes four checks in code (`ground_report`):
+  - it is at least 20 characters;
+  - it appears verbatim (case and whitespace normalized) in a cited, shown chunk;
+  - it shares a salient term with the assertion;
+  - its negation polarity matches the assertion's.
+
+  These checks do not prove semantic support. They stop a valid ID, an off-topic excerpt or a contradicting excerpt from counting as support on the model's say-so. Failures go toward REVIEW, the conservative direction, and the false-negative rate is an M6 measurement. With no retrieved evidence, the verifier is not called and every assertion counts as unsupported. Security findings whose citations are all invalid are now kept with no evidence, so they count as unsupported (and, if high severity, as critical), instead of disappearing.
+- **Untrusted content.** Prompts are now `v3`. Every system prompt states that tool output and retrieved documents are data, and retrieved text arrives in a field named `untrusted_retrieved_documents`. Retrieved chunks pass a deterministic screen for instruction-like text (`app/graph/injection.py`). Matching chunks are withheld from every prompt and are not citable. Any hit, and any injection report from the verifier, is a REVIEW floor: it can escalate a PASS but cannot decide BLOCK or weaken one. This is a coarse first line of defence; the adversarial suite is M7.
+- **Leakage.** At runtime, `deterministic_signal_layer` resets the three verification fields (`runtime_signals`); the graph measures them itself. Agents see signals with those fields removed and a change package restricted to observable fields: ID, source, pack, primary service, changed files, origin nodes. M1 fixture evaluation is unchanged and still uses the stubs; that is what they are for.
+- **Reliability, in the same pass.**
+  - Degraded runs skip later LLM nodes: after the step and budget guards, at fan-out, after fan-in, and after repair.
+  - Concurrent agents are limited by a semaphore instead of raising.
+  - Structured-output, MCP and validation failures inside an agent, the verifier or repair degrade to REVIEW without weakening a BLOCK. Provider quota and auth errors still stop the run; they are not analysis outcomes.
+  - Missing retrieval degrades instead of silently passing.
+  - The risk engine always returns an assessment.
+  - `run_tests` receives the allowlisted required test IDs and is always a dry run.
+  - `trace_metrics.repair_count` is now populated.
+  - CHG-E001's manifest gains its missing `changed_files`.
+  - The temperature sweep computes validity over completed responses, so a 503 is no longer counted as a schema failure. Re-scored this way, the earlier proxy sweep favours 0.0 (2/2) over 0.2 (3/3) only by tie-break. `AGENT_LLM_TEMPERATURE` stays at 0.2 as a provisional value until the primary model is measured.
+- **Earlier live results** (`evals/graph/m4_sample_results*.json`) are kept unchanged. They were produced before these fixes, with fixture labels leaking into agent prompts and an ungrounded verifier, so they show that the graph runs end to end. They are not evidence of decision quality.
+
+Tests: `tests/unit/test_policy_gate.py`, `tests/unit/test_grounding.py`, `tests/unit/test_evidence_context.py`, `tests/unit/test_temperature_sweep_metrics.py`, `tests/graph/test_evidence_grounding.py`, `tests/graph/test_no_label_leakage.py`, `tests/graph/test_degradation_paths.py`, `tests/graph/test_interrupt_resume.py`, `tests/graph/test_test_strategist_context.py`.
+
+## M4 reliability: parallel branches overshot the call budget, and provider timeouts were never caught
+
+**What looked wrong.** Three problems turned up while preparing a controlled live run.
+
+1. With `ANALYSIS_MAX_LLM_CALLS=2` and four parallel agents, a probe made five LLM calls.
+2. A Triage Planner connection or timeout failure would abort the run instead of degrading it.
+3. The live-sample script did not record which policy override decided the outcome or why grounding rejected a judgment.
+
+**Investigation.**
+
+- *Budget.* `_generate` called `check_llm_call()`, awaited the provider, then called `record_llm_call()`. Branches suspended inside the provider call had all passed the check, so none had recorded anything yet. In the full offline graph, a fake LLM that holds every call until all four branches are inside it reproduces the overshoot: five calls against a limit of four, and two to five against limits of one to four. Tokens have the same shape, but token usage cannot be known before the response, so a strict token ceiling is not achievable.
+- *Retries.* LangGraph's default node `retry_on` retries any exception outside a short builtin list. A 429, a daily-quota error or a rejected API key on an LLM node would therefore re-run the node, making a second provider call against an exhausted quota.
+- *Triage.* `triage_planner_node` caught only budget and structured-output errors. A wider problem sits under it: the agent nodes' `ConnectionError`/`TimeoutError` handling never matched real provider failures. `openai.APIConnectionError`, `APITimeoutError`, `httpx.TransportError` and Gemini's `ServerError` all inherit from `Exception`, not from the builtin types, so in a live run a provider timeout in any agent escaped the degradation path. Only test doubles raising the builtin types were caught.
+
+**Decision.**
+
+- **Reserve, then settle.** `AnalysisBudget.reserve_llm_call()` checks capacity and increments an in-flight count with no `await` in between, under a lock. The reservation settles once, as `complete` (with usage) or `fail`. In-flight, completed and failed calls all count against `max_llm_calls`. A failed call is not refunded, because it may have reached the provider; that includes cancellation. A schema-invalid response now carries its token usage on `StructuredOutputError`, so it is counted too. Gateway transient retries (5xx only) stay inside one logical call, which bounds provider attempts at `max_llm_calls × (1 + transient_retries)`. A LangGraph node retry is a new logical call with its own reservation.
+- **Token semantics, stated plainly.** Token limits are checked at reservation time against settled usage. Once settled usage reaches a limit, no new call starts. The overshoot is bounded by the usage of calls already in flight, at most `max_parallel_agents`. A test pins this bound.
+- **Resume.** `TraceMetrics` gains `llm_calls_failed`, and `restore_counters` restores it and clears the in-flight count. Checkpoints fall between supersteps, so no call is in flight across a resume.
+- **Provider failures.** After its own retries, the gateway translates connection, timeout and 5xx failures into `ProviderUnavailableError`, a `ConnectionError` subclass, so every agent node's existing handling degrades the run to REVIEW. Quota, rate-limit and auth errors are never translated. They propagate as operational stops, and the node retry policy now skips them (`retry_node_on`).
+- **Triage.** `AGENT_FAILURES` raised by the Triage Planner now degrade the run: the default plan is recorded, no specialist runs, and the deterministic gate decides with a REVIEW floor, so a dependency BLOCK stays BLOCK. A schema-invalid plan still clamps to the default plan and continues. Unexpected exceptions still propagate.
+- **Instrumentation.** Each `scripts/run_m4_sample.py` row now records:
+  - `risk_score`, `override_applied` and `overrides_matched`;
+  - `grounding_rejections`, with reasons;
+  - `injection_evidence_ids`, the screened chunk IDs, and the verifier's injection flag;
+  - the retrieved chunk count and `approval_status`;
+  - `llm_calls_failed`, inside `trace_metrics`.
+
+  When verification did not run, coverage, assertion count and grounding fields are `null`, not zero. The default output is a new file, and the script refuses to overwrite an existing results file, so historical results cannot be replaced by accident.
+
+Tests: `tests/graph/test_budget_concurrency.py` (fails without the reservation), `tests/unit/test_budget.py`, `tests/graph/test_triage_failures.py`, `tests/unit/test_provider_errors.py`, `tests/graph/test_sample_result_summary.py`, `tests/graph/test_interrupt_resume.py`.
+
+## M4 post-hardening live validation: BLOCKs hold, and the corpus cannot support any assertion
+
+This is the first live run on the hardened graph: commit `a6636e6`, prompts v3, source-grounded verifier, no fixture labels in agent input. Earlier live results (`m4_sample_results*.json`) predate all of that and are not comparable as measures of decision quality.
+
+**Setup.**
+- Fixtures: four, from `evals/graph/m4_hardened_scenarios.jsonl`, one pass, on 2026-11-23.
+- Models: agents on `nvidia/nemotron-3.5-super-vl:free` (OpenRouter), triage on `gemini-3.5-flash-lite`, temperature 0.2.
+- Limits: default budgets (25 calls, 200k input and 50k output tokens), 4 parallel agents, 120 s node timeout, 3 transient retries on 5xx only.
+- Isolation: separate checkpoint and audit files. Results are in `evals/graph/m4_hardened_sample_results.json`.
+
+**Outcome.**
+
+| Fixture | Expected | Actual | Score | Deciding override | Matched overrides | Coverage | Calls (in/out tokens) |
+|---|---|---|---|---|---|---|---|
+| CHG-E003 | BLOCK | BLOCK | 42 | `dependency-vuln-ceiling` | dependency-vuln-ceiling, unsupported-critical-claim, weak-evidence | 0.0 | 7 (40,793 / 19,726) |
+| CHG-H001 | PASS | REVIEW | 20 | `weak-evidence` | weak-evidence | 0.0 | 6 (38,640 / 12,144) |
+| CHG-E001 | PASS | REVIEW | 48 | `weak-evidence` | weak-evidence | 0.0 | 6 (43,938 / 16,676) |
+| CHG-E002 | BLOCK | BLOCK | 45 | `critical-contract-break` | critical-contract-break, unsupported-critical-claim, weak-evidence | 0.0 | 8 (40,392 / 15,308) |
+
+**Provider usage and failures.**
+- 27 logical LLM calls, 0 failed. HTTP attempts matched exactly: 23 OpenRouter completions and 4 Gemini triage calls, all 200.
+- No retries and no 429/503. 20 new query embeddings; 11 queries were cache hits.
+- No degradation and no errors.
+
+**Gate integrity.**
+- CHG-E003 matched `weak-evidence` and `unsupported-critical-claim` (both REVIEW, listed first in `policy.yaml`) together with `dependency-vuln-ceiling`. The first-match gate would have returned REVIEW; strictest-wins returned BLOCK. This is the downgrade path fixed in the hardening pass, now exercised live.
+- CHG-E002:
+  - paused at the approval interrupt and resumed on the same checkpoint thread;
+  - wrote exactly one audit record, whose `analysis_id` matches the thread;
+  - kept its trace across the resume (8 calls, 40,392 input tokens, repair count 1 before and after).
+- CHG-E001 was triaged as `documentation` with three agents. It was misclassified as `api_contract` before its `changed_files` were added.
+- Citations: no invalid citation survived the filter. One invented ID (`none::none`, CHG-E003) was rejected before it reached the report.
+- No chunk was screened as instruction-like and the verifier raised no injection flags.
+
+**No label leakage.**
+- No hypothesis repeats a fixture annotation. The pre-hardening CHG-H001 "10% lacks coverage" hypothesis is gone.
+- The two numeric probe hits (`0.85`, `0.9`) are the Investigator's own `relevance_score` values, not manifest stubs.
+
+**Finding: evidence coverage is 0.0 everywhere, and that is the correct reading of this corpus.**
+- The verifier saw 21–27 retrieved chunks per fixture and marked every material assertion unsupported, with no citations or quotes. Because it judged nothing `supported`, the code-side grounding check had nothing to reject (`grounding_rejections` is empty), and the LLM-reported coverage matches the computed 0.0.
+- Reading the chunks confirms the verifier is right. The knowledge corpus is generated from a template (`scripts/bootstrap_knowledge_corpus.py`): every document repeats the same generic paragraphs with its own name substituted ("Test strategists MUST map required tests to services impacted by … modifications"). No retrieved chunk mentions:
+  - `amount_cents` (CHG-E002);
+  - the GHSA advisory or the vulnerable dependency (CHG-E003);
+  - the changed README files (CHG-H001, CHG-E001).
+
+  The contract documents describe a generic `SubmitRequest`, not the fixture contracts.
+- The assertions themselves are about tool output: contract diff, blast radius, scanner findings and test inventory. These are facts the corpus does not and cannot restate.
+- The Evidence Investigator still labelled most of these chunks `support`. Those are relevance judgements, not support. The verifier no longer sees those labels, and it did not reproduce them.
+- The same corpus produced 0.6–1.0 coverage in the pre-hardening runs. That coverage was the verifier echoing the Investigator's stances, not evidence.
+
+**Consequence for the PASS fixtures.**
+- CHG-H001 scores 20, which is PASS by score. It becomes REVIEW only through `weak-evidence`.
+- CHG-E001 scores 48, which is already REVIEW by score: heuristic blast radius 20, critical service 17.5, and the evidence-confidence penalty 10. Without the penalty it would be 38 (PASS).
+  - The blast radius comes from a heuristic `svc-inventory → svc-payment-api` edge attributed to a documentation file, which the Change Analyst itself flagged as unresolved. It is the same pattern as the earlier CHG-H001 blast-radius entry.
+- Both are calibration findings, not implementation failures: the gate refused to pass changes it could not ground. Thresholds, labels and the corpus were left unchanged.
+
+**Implications for M6.**
+- The corpus needs change-specific content, or the fixtures need assertions the corpus can actually support.
+- Tool-derived assertions (contract diff, scanner output, blast radius) should be verifiable against the deterministic signals that produced them, rather than counted as unsupported prose.
+- The doc-only blast-radius attribution needs a deterministic fix.
+- Until then, a documentation change cannot reach PASS on this corpus, so PASS recall is unmeasured.

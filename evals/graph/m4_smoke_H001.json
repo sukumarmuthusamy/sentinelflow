@@ -1,0 +1,18 @@
+{
+  "meta": {
+    "run_at_utc": "2026-11-23T00:12:01+00:00",
+    "agent_model": "gemini-3.8-flash",
+    "triage_model": "gemini-3.5-flash-lite",
+    "agent_temperature": 0.2,
+    "rpm": 5,
+    "stopped_reason": null
+  },
+  "results": [
+    {
+      "change_id": "CHG-H001",
+      "status": "failed",
+      "error": "GoogleAPIError: 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}",
+      "elapsed_seconds": 71.8
+    }
+  ]
+}

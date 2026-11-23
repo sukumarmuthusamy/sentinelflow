@@ -1,0 +1,5 @@
+{"change_id": "CHG-H001", "domain_pack_id": "healthcare-claims", "record_decision": false, "notes": "documentation-only PASS"}
+{"change_id": "CHG-H003", "domain_pack_id": "healthcare-claims", "record_decision": false, "notes": "secret exposure BLOCK"}
+{"change_id": "CHG-H002", "domain_pack_id": "healthcare-claims", "record_decision": false, "notes": "critical contract break BLOCK"}
+{"change_id": "CHG-E001", "domain_pack_id": "ecommerce-payments", "record_decision": false, "notes": "payments documentation change PASS"}
+{"change_id": "CHG-E002", "domain_pack_id": "ecommerce-payments", "record_decision": true, "notes": "contract break BLOCK; approval interrupt demo"}

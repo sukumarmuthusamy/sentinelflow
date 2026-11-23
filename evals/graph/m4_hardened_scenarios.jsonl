@@ -1,0 +1,4 @@
+{"change_id": "CHG-E003", "domain_pack_id": "ecommerce-payments", "record_decision": false, "notes": "dependency vulnerability BLOCK; strictest-wins gate check"}
+{"change_id": "CHG-H001", "domain_pack_id": "healthcare-claims", "record_decision": false, "notes": "documentation-only PASS; no-leakage and grounding false-negative check"}
+{"change_id": "CHG-E001", "domain_pack_id": "ecommerce-payments", "record_decision": false, "notes": "payments documentation PASS; triage category with changed_files"}
+{"change_id": "CHG-E002", "domain_pack_id": "ecommerce-payments", "record_decision": true, "notes": "contract break BLOCK; approval interrupt, resume and single audit write"}

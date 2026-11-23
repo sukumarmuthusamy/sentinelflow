@@ -101,17 +101,23 @@ def incident_similarity_norm() -> float:
 
 
 def evidence_confidence_norm(*, unsupported_assertion_rate: float = 0.0) -> float:
-    """Penalty input for unsupported assertions.
+    """Penalty input: the unsupported-assertion rate, in ``[0, 1]``.
 
-    Returns 0.0 during M1 unless explicit unsupported-assertion data is supplied.
-    The Evidence Verifier will populate this in M4.
+    Higher means weaker evidence. The weight is applied with a positive sign (see
+    ``apply_weights``) so weak evidence can only raise risk; agent output never
+    lowers a deterministic score. The rate itself is computed in code from the
+    Evidence Verifier's per-assertion judgments (``app/graph/verification.py``).
+    Returns 0.0 when no verification data is supplied (M1 fixture mode).
     """
     return max(0.0, min(1.0, unsupported_assertion_rate))
 
 
 def compute_norms(signals: DeterministicSignals, domain_pack: DomainPack) -> NormBreakdown:
     """Compute all normalized terms for a signal bundle."""
-    unsupported_rate = 1.0 if signals.critical_claims_unsupported else 0.0
+    if signals.unsupported_assertion_rate is not None:
+        unsupported_rate = signals.unsupported_assertion_rate
+    else:
+        unsupported_rate = 1.0 if signals.critical_claims_unsupported else 0.0
     return NormBreakdown(
         blast_radius_norm=blast_radius_norm(signals.blast_radius),
         critical_service_norm=critical_service_norm(signals.impacted_services, domain_pack),
@@ -141,8 +147,10 @@ def apply_weights(norms: NormBreakdown, weights: RiskWeights) -> tuple[float, di
         "security_severity": weights.security_severity * norms.security_severity_norm,
         "test_gap": weights.test_gap * norms.test_gap_norm,
         "incident_similarity": weights.incident_similarity * norms.incident_similarity_norm,
+        # Positive sign: unsupported assertions add risk. An earlier version subtracted
+        # this term, so more unsupported assertions lowered the score.
         "evidence_confidence_penalty": (
-            -weights.evidence_confidence_penalty * norms.evidence_confidence_norm
+            weights.evidence_confidence_penalty * norms.evidence_confidence_norm
         ),
     }
     total = sum(components.values())
