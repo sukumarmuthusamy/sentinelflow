@@ -2,8 +2,10 @@
 
 Layering. Routes (``app.api``) translate HTTP to calls here and errors back to HTTP.
 This service owns lifecycle rules and launches work; the store owns atomicity; the
-``GraphExecutor`` is the only thing that touches LangGraph. M5-B adds streaming by
-subscribing to the store's events and to executor callbacks, not by changing routes.
+``GraphExecutor`` is the only thing that touches LangGraph. Progress streaming (M5-B)
+hangs off two seams: the store's post-commit listener feeds every durable event to
+the in-process ``JobEventBus``, and each run gets a ``GraphEventSink`` that records
+node events and publishes live fragments. Subscribers only ever read.
 
 Execution. Each job runs as an asyncio task in this process, gated by a semaphore of
 ``api_max_concurrent_runs``. A job is acquired by a ``queued -> running``
@@ -46,6 +48,7 @@ from app.jobs.results import (
     root_exception,
 )
 from app.jobs.runtime import AnalysisRuntime, GraphExecutor, GraphOutcome
+from app.jobs.streaming import GraphEventSink, JobEventBus, JobEventStream
 from app.persistence.job_store import CreateOutcome, SqliteJobStore, utc_now
 
 logger = logging.getLogger(__name__)
@@ -94,14 +97,24 @@ class JobService:
         self._evaluation_runner = evaluation_runner
         self._slots = asyncio.Semaphore(settings.api_max_concurrent_runs)
         self._tasks: set[asyncio.Task[None]] = set()
+        self._bus = JobEventBus(
+            queue_size=settings.api_sse_queue_size,
+            max_subscribers_per_job=settings.api_sse_max_subscribers_per_job,
+        )
+        store.set_listener(self._bus.publish_committed)
 
     @property
     def store(self) -> SqliteJobStore:
         return self._store
 
+    @property
+    def bus(self) -> JobEventBus:
+        return self._bus
+
     # -- lifecycle of the service itself --------------------------------------
 
     async def start(self) -> RecoveryReport | None:
+        self._bus.bind_loop(asyncio.get_running_loop())
         await asyncio.to_thread(self._store.initialize)
         if self._settings.api_recover_jobs_on_startup:
             return await self.recover()
@@ -158,6 +171,23 @@ class JobService:
                 details={"job_id": job_id},
             )
         return job
+
+    async def open_event_stream(self, job_id: str, *, after_seq: int) -> JobEventStream:
+        """Subscribe to an analysis job's events, replaying durable ones after ``after_seq``.
+
+        Read-only: opening, reading or abandoning a stream never starts, resumes or
+        cancels the job. Raises ``JOB_NOT_FOUND`` (also for an evaluation id) and
+        ``TOO_MANY_SUBSCRIBERS`` before any response is started.
+        """
+        await self.get_job(job_id, kind=JobKind.ANALYSIS)
+        subscription = self._bus.subscribe(job_id)
+        return JobEventStream(
+            store=self._store,
+            subscription=subscription,
+            after_seq=after_seq,
+            keepalive_seconds=self._settings.api_sse_keepalive_seconds,
+            retry_ms=self._settings.api_sse_retry_ms,
+        )
 
     # -- creation --------------------------------------------------------------
 
@@ -409,25 +439,45 @@ class JobService:
             started_at=utc_now(),
         )
 
+    async def _sink(self, job: JobRecord) -> GraphEventSink:
+        return GraphEventSink(
+            store=self._store,
+            bus=self._bus,
+            job_id=job.job_id,
+            run=job.run_count,
+            last_seq=await asyncio.to_thread(self._store.last_seq, job.job_id),
+            settings=self._settings,
+        )
+
     async def _execute_start(self, job: JobRecord) -> None:
         request = AnalysisRequest.model_validate(job.request)
         assert job.thread_id is not None
-        outcome = await self._executor.start(
-            request,
-            thread_id=job.thread_id,
-            analysis_id=job.job_id,
-        )
+        sink = await self._sink(job)
+        try:
+            outcome = await self._executor.start(
+                request,
+                thread_id=job.thread_id,
+                analysis_id=job.job_id,
+                on_event=sink,
+            )
+        finally:
+            sink.close()
         await self._settle_analysis(job, outcome, prior=None)
 
     async def _execute_resume(self, job: JobRecord) -> None:
         assert job.thread_id is not None and job.approval is not None and job.result is not None
         request = AnalysisRequest.model_validate(job.request)
         prior = AnalysisResult.model_validate(job.result)
-        outcome = await self._executor.resume(
-            request,
-            thread_id=job.thread_id,
-            approved=job.approval.approved,
-        )
+        sink = await self._sink(job)
+        try:
+            outcome = await self._executor.resume(
+                request,
+                thread_id=job.thread_id,
+                approved=job.approval.approved,
+                on_event=sink,
+            )
+        finally:
+            sink.close()
         await self._settle_analysis(job, outcome, prior=prior)
 
     async def _settle_analysis(
@@ -437,6 +487,17 @@ class JobService:
         *,
         prior: AnalysisResult | None,
     ) -> None:
+        if not outcome.finished and not outcome.interrupted:
+            # The stored checkpoint has pending nodes but no interrupt: the run did not
+            # reach END, so nothing may be reported as a completed decision.
+            logger.error("job %s: checkpoint incomplete (%s)", job.job_id, outcome.next_nodes)
+            await asyncio.to_thread(
+                self._fail_sync,
+                job.job_id,
+                JobStatus.RUNNING,
+                job_error(ErrorCode.GRAPH_INCOMPLETE),
+            )
+            return
         result = build_analysis_result(outcome.state, analysis_id=job.job_id)
         if prior is not None:
             # Approval gates the audit write; it must never move the decision.

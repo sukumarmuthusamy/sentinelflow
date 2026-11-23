@@ -25,6 +25,9 @@ T = TypeVar("T", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
 
+# Run-metadata key set on every structured-output call made through the gateway.
+STRUCTURED_OUTPUT_METADATA_KEY = "sentinelflow_structured_schema"
+
 
 class StructuredOutputError(Exception):
     """The provider responded, but the output did not validate against the schema.
@@ -116,6 +119,12 @@ class _PacedStructuredLLM:
                 method=self.structured_method,
                 include_raw=True,
             )
+        # Metadata only (no behaviour change): it rides on callback events, so a
+        # LangGraph "messages" stream can tell this gateway's structured-output runs
+        # from any other model call, and name the schema a fragment belongs to.
+        structured = structured.with_config(
+            metadata={STRUCTURED_OUTPUT_METADATA_KEY: schema.__name__},
+        )
         messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
         attempt = 0
         while True:
@@ -199,6 +208,9 @@ class OpenRouterStructuredLLM(_PacedStructuredLLM):
             "api_key": self._settings.require_openrouter_api_key(),
             "base_url": self._settings.openrouter_base_url,
             "default_headers": {"X-Title": "SentinelFlow"},
+            # Only affects streamed calls (API_STREAM_TOKENS): with a custom base URL
+            # langchain-openai omits usage from streams, which would zero token budgets.
+            "stream_usage": True,
         }
         if self._client_max_retries is not None:
             kwargs["max_retries"] = self._client_max_retries

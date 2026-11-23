@@ -1,4 +1,4 @@
-# ADR-0003: HTTP job lifecycle for the local harness (M5-A)
+# ADR-0003: HTTP job lifecycle and progress streaming for the local harness (M5-A, M5-B)
 
 - **Status:** Accepted
 - **Date:** 2026-11-23
@@ -21,7 +21,7 @@ An analysis takes minutes and spends free-tier provider quota. Clients time out 
 | Persistence | `app/persistence/job_store.py` | Atomic creates, compare-and-set transitions, lifecycle event log |
 | Execution | `app/jobs/runtime.py` | `GraphExecutor`: the only caller of `run_analysis` / `resume_analysis`; `AnalysisRuntime` port for MCP, LLM and retrieval |
 
-Routes never touch the graph or the store. M5-B adds streaming inside `GraphExecutor` (switching `ainvoke` to `astream`) and an SSE route that reads the event log. The service and existing routes stay as they are.
+Routes never touch the graph or the store. M5-B added streaming at two seams, leaving the other routes unchanged: `GraphExecutor` observes the run through `astream`, and the store hands every committed event to an in-process bus that feeds the SSE route (see Streaming).
 
 ### Persistence
 
@@ -85,26 +85,74 @@ The table in `app/jobs/models.py` is closed. Terminal states have no exits, and 
   - `python -m app.api.serve` binds 127.0.0.1, refuses a public bind without a key, and runs one worker.
   - Bodies are capped at `API_MAX_BODY_BYTES` before routing.
 
-### Streaming boundary (M5-B, contracts only here)
+### Streaming (M5-B)
 
-`app/jobs/events.py` defines one envelope, `{job_id, seq, type, at, data}`, for two event families:
+`GET /v1/analyses/{job_id}/events` is a Server-Sent Events stream (`text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`). It sits behind the same access guard as the other `/v1` routes. An unknown job id, and an evaluation job id, get `404 JOB_NOT_FOUND` before any stream starts.
 
-- **Lifecycle events** (`job.*`) are emitted in M5-A and persisted with gap-free per-job `seq`. That `seq` is the SSE `id` for `Last-Event-ID` replay.
-- **`node.started`, `node.completed` and `agent.token`** are defined but **not emitted**. `EMITTED_EVENT_TYPES` excludes them, and a test pins that.
+**How the graph is observed.** Modules: `app/graph/streaming.py`, `app/jobs/streaming.py`.
 
-**How M5-B can produce them:**
+- `GraphExecutor` passes an event sink to `run_analysis` / `resume_analysis`. They then call `stream_graph`, which runs the compiled graph **once** with `astream(stream_mode=["values", "tasks"] (+ "messages"), durability="sync", version="v2")`. It returns what `ainvoke` returns: the latest values, plus `__interrupt__`. The thread id, checkpointer, `Command(resume=…)` path, budget restoration and gate idempotency key are unchanged. Without a sink, the M4 `ainvoke` path runs unchanged.
+- Behaviour verified against langgraph 1.2.11:
+  - `tasks` mode yields one start part and one result part per node task. `Send` branches of `run_parallel_agent` get distinct task ids. Node retries are invisible. A resumed interrupt re-runs its task with the same task id.
+  - `messages` mode yields `(chunk, metadata)` for model calls inside nodes, because callbacks propagate through context variables. `langgraph_checkpoint_ns` is `<node>:<task id>`.
+- **Settling.** After the run, the executor reads the thread's stored checkpoint (`read_checkpoint`) and settles the job from that, not from the in-memory return value.
+  - It is `completed` only if the checkpoint has no pending node and no interrupt.
+  - It is `waiting_for_approval` only if an interrupt is pending.
+  - Anything else fails with `GRAPH_INCOMPLETE`.
 
-- `astream(..., stream_mode=["updates", "messages"], version="v2", durability="sync")` exists in LangGraph 1.2.11.
-- An offline probe confirmed that `messages` mode captures tokens from a chat model invoked inside a node even though the gateway does not forward the node's `RunnableConfig` (callbacks propagate through contextvars).
-- Interrupts then arrive as an `__interrupt__` update, and the final state is read with `aget_state`.
+**Events.**
 
-**Known uncertainties and incompatibilities:**
+| Type | Class | Payload (never state values) |
+|---|---|---|
+| `job.*` | durable | as M5-A |
+| `node.started` / `node.completed` | durable | `node`, `task_id`, `agent`, `run` (1 = first run, 2 = resume). `node.completed` adds `status` (`ok`/`error`/`interrupted`), the **names** of written state keys, and `fragments_streamed` / `fragments_dropped` |
+| `agent.token` | live | `node`, `task_id`, `agent`, `run`, `index`, `response`, `schema_name`, `channel` (`content` / `tool_call_arguments`), `format: "structured_json"`, `provisional: true`, `verified: false`, `text` |
+| `stream.gap` | live | `reason: "slow_client"`, `dropped_live_events` |
 
-1. **Tokens are JSON fragments, not prose.** The gateway uses `with_structured_output(include_raw=True)`, so streamed chunks are fragments of structured output: Gemini tool-call arguments, or OpenRouter `json_schema` content. Whether `ChatGoogleGenerativeAI` streams at all inside a structured-output runnable under `messages` mode has not been verified against the live provider.
-2. **No subgraphs.** Agents are plain gateway calls inside nodes, not `create_agent` subgraphs, so the plan's `subgraphs=True` note does not apply. Parallel agents share the node `run_parallel_agent` and must be told apart by task id in the event metadata.
-3. **The test double cannot stream.** `StaticStructuredLLM` emits no tokens, so offline token tests need a streaming fake chat model behind the gateway.
-4. **Token events stay live-only.** They are too voluminous to persist, so a reconnecting client replays lifecycle and node events, not tokens.
-5. **One process owns the stream.** The live fan-out is in-process, so an SSE client must reach the process that runs the job (the single-worker assumption again).
+Node inputs, errors and interrupt payloads are dropped in translation, so nothing a node read or raised reaches the stream.
+
+**Ordering, persistence and replay.**
+
+- **Durable events** share the job's gap-free `seq` with lifecycle events. They are written only while the job is `running` (`append_events` checks the status in the same transaction), so nothing can follow a run's `job.failed`. The SSE `id:` is `seq`.
+- **Live events have no `id:` line**, so they never move the browser's `Last-Event-ID`, and there are no live ids to collide or leave gaps. Instead each carries `after_seq`, the durable event it follows, and `(run, index)`, which is gap-free per run as emitted.
+- **Connecting:** subscribe first, then replay the store's durable events after `Last-Event-ID` (an integer, else `422`).
+  - Durable events at or below the last `seq` sent are skipped.
+  - A jump in `seq` is filled from the store.
+  - A live event whose `after_seq` is older than a durable event already sent is not delivered, so a fragment never appears after its node's `node.completed`.
+- **End of stream:** the stream ends after `job.completed` or `job.failed`, and immediately for a terminal job whose terminal event the client already has. It stays open through `waiting_for_approval`.
+- **Keepalive:** a `: keepalive` comment every `API_SSE_KEEPALIVE_SECONDS`. Each one also re-reads the store as a safety net. There is no busy-waiting: the stream blocks on its queue with a timeout.
+- **Fan-out:** the store calls a listener after each commit. The bus publishes through `call_soon_threadsafe`, which is queued before the store call's own result, so a writer's events are published before it resumes.
+
+**Slow and disconnected clients.**
+
+- Each subscriber has a bounded queue (`API_SSE_QUEUE_SIZE`), and publishing is `put_nowait`. The graph never awaits a client.
+- A full queue marks the subscriber **lagged**. It then drops new items until it has drained. It receives `stream.gap` with the number of live events it lost, then re-reads missed durable events from the store.
+- At most `API_SSE_MAX_SUBSCRIBERS_PER_JOB` streams per job; beyond that, `429 TOO_MANY_SUBSCRIBERS`.
+- Disconnecting cancels only that response, and the subscription is released even if the client leaves before the first frame. Subscribers only read: no number of them can start, resume, retry or cancel a job, and the run executes once.
+- Errors while recording progress are logged by type and dropped. They cannot fail the run, alter the decision or touch the audit write (pinned by a test that breaks `append_events`).
+
+**Token policy.**
+
+- **Real fragments only.** A fragment is forwarded only when (a) it is an `AIMessageChunk`, i.e. really streamed, and (b) its run carries the gateway's metadata tag, which the gateway sets on every structured-output call along with the schema name.
+  - For a non-streaming model, LangGraph emits the finished `AIMessage`. It is dropped, not replayed as tokens.
+  - Thinking/reasoning content blocks are dropped; only `text` blocks and tool-call argument fragments pass.
+- **Structured, not prose.** Every fragment is a piece of schema-shaped JSON (`format: "structured_json"`), labelled `provisional` and `verified: false`. The decision endpoint is authoritative.
+- **Sanitized before leaving the process:**
+  - control and format characters are stripped (bidi overrides, zero-width);
+  - credential shapes are redacted: Google, OpenAI/OpenRouter, GitHub, Slack, AWS key ids, Bearer tokens, JWTs and private-key blocks;
+  - the exact values of configured secrets are redacted.
+
+  Redaction runs over a 128-character held-back window per response, so a credential split across chunks is still caught; a private-key block is held until its END line. Fragments are therefore re-chunked: up to 128 characters later than the provider sent them, and at most `API_STREAM_FRAGMENT_MAX_CHARS` each.
+- **Bounded:** at most `API_STREAM_MAX_FRAGMENTS_PER_RUN` per run. Further fragments are counted in `fragments_dropped`.
+- **Opt-in:** off unless `API_STREAM_TOKENS=true`. `messages` mode attaches a streaming callback handler, and LangChain then calls the provider's *streaming* API (`BaseChatModel._should_stream`). That changes the HTTP call live providers receive.
+  - `langchain-openai` omits usage from streams when `base_url` is custom, which would zero OpenRouter token budgets. The OpenRouter client therefore sets `stream_usage=True`, which affects only streamed calls.
+  - Neither Gemini nor OpenRouter structured-output streaming has been run live. Node and lifecycle events stream regardless of this setting.
+
+**Not covered.**
+
+- Token events cannot be replayed: a client that connects late sees the remaining fragments only.
+- The live fan-out is per process, so an SSE client must reach the process running the job (one worker, as before).
+- Redaction is pattern-based. It cannot recognise a credential with an unknown shape, only configured values and known formats.
 
 ## Consequences
 
@@ -112,7 +160,7 @@ The table in `app/jobs/models.py` is closed. Terminal states have no exits, and 
 
 - Every M4 approval and audit invariant holds over HTTP, each pinned by an ASGI-level test, including concurrent duplicate approvals, a restart between pause and approval, and a failed gate write.
 - A client retry cannot buy a second analysis, and a refused request cannot burn a key.
-- Lifecycle events are durable and ordered, which is the replay basis M5-B needs.
+- Lifecycle and node events are durable and ordered, so a reconnecting client resumes from `Last-Event-ID` without loss or duplicates. A slow client is told what it lost instead of stalling the graph.
 - No new infrastructure: SQLite next to the existing checkpoint database.
 
 ### Negative
@@ -121,7 +169,7 @@ The table in `app/jobs/models.py` is closed. Terminal states have no exits, and 
   - a crash mid-run ends the job as `JOB_INTERRUPTED`, never as a completed job;
   - LLM calls already made in that run are spent;
   - provider calls inside a run are not deduplicated.
-- **Single process per job database.** The atomic create and transition hold across processes, but recovery, the run semaphore and future live streaming do not. `serve` enforces one worker. Running several workers against one database is unsupported.
+- **Single process per job database.** The atomic create and transition hold across processes, but recovery, the run semaphore and the live event fan-out do not. `serve` enforces one worker. Running several workers against one database is unsupported.
 - **No cancel or retry endpoint.** A gated job whose audit write failed (`MCP_ERROR` after approval) keeps its decision but cannot be re-approved in M5-A.
 - **The deterministic evaluation suite only checks consistency.** Its fixtures are labelled with the decisions the M1 integration test already enforces, so its 100% decision accuracy is by construction, not a measurement. The graph and retrieval suites need live providers and stay as M4 and M3 scripts until M6.
 
@@ -140,9 +188,13 @@ The table in `app/jobs/models.py` is closed. Terminal states have no exits, and 
 | Postgres job store now | Adds a required service to a harness that otherwise runs on SQLite; the store is small enough to port in M8 |
 | Re-run interrupted `running` jobs on startup | Silently repeats provider calls; the user-visible failure is the safer default |
 | Lease/heartbeat ownership for multi-worker | Real distributed coordination for a single-user local harness; documented as a limit instead |
+| Persist token events | Hundreds per run; replaying stale provisional JSON adds little. Node counts record what was streamed |
+| SSE ids for token events | Every reconnect would need token replay or would see id gaps; `after_seq` orders them without touching `Last-Event-ID` |
+| Block the graph on slow clients (unbounded queues) | One stalled browser tab would hold a paid analysis open or grow memory without bound |
+| `astream_events` (callbacks v2) | Lower-level and noisier: needs manual filtering of chain events. `tasks` + `messages` give node boundaries and chunks directly |
 
 ## References
 
 - [SENTINELFLOW_PLAN.md](../../SENTINELFLOW_PLAN.md) §8 (M5), §10 (rejected: Celery/Redis), §6 (streaming notes)
-- `app/jobs/`, `app/persistence/job_store.py`, `app/api/`, `tests/api/`
+- `app/jobs/`, `app/graph/streaming.py`, `app/persistence/job_store.py`, `app/api/`, `tests/api/`, `tests/graph/test_graph_streaming.py`
 - ADR-0001 (MCP client adapter)

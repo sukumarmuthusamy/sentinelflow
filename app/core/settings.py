@@ -120,6 +120,27 @@ class Settings(BaseSettings):
     api_recover_jobs_on_startup: bool = True
     api_gemini_rpm: int = Field(default=5, ge=1, description="Pacer for API-launched runs")
 
+    # M5-B — SSE progress stream (ADR-0003 "Streaming").
+    api_stream_tokens: bool = Field(
+        default=False,
+        description=(
+            "Forward live structured-output fragments (agent.token). Turning this on makes "
+            "the providers use their streaming APIs; unverified against live Gemini and "
+            "OpenRouter, so it is off by default. Node and lifecycle events always stream."
+        ),
+    )
+    api_stream_fragment_max_chars: int = Field(default=512, ge=16, le=8_192)
+    api_stream_max_fragments_per_run: int = Field(default=4_000, ge=1, le=100_000)
+    api_sse_keepalive_seconds: float = Field(default=15.0, gt=0, le=300)
+    api_sse_queue_size: int = Field(
+        default=256,
+        ge=4,
+        le=10_000,
+        description="Per-subscriber buffer; a client that falls this far behind loses live events",
+    )
+    api_sse_max_subscribers_per_job: int = Field(default=8, ge=1, le=100)
+    api_sse_retry_ms: int = Field(default=3_000, ge=100, le=60_000)
+
     @field_validator(
         "domains_root",
         "embedding_cache_path",

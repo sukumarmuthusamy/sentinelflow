@@ -26,7 +26,7 @@ from app.jobs.evaluation import EvaluationRunner, run_deterministic_fixture_suit
 from app.jobs.runtime import AnalysisSession
 from app.jobs.service import JobService
 from app.main import create_app
-from app.model_gateway.llm import LLMResult, StaticStructuredLLM
+from app.model_gateway.llm import LLMResult, StaticStructuredLLM, StructuredLLM
 from fastapi import FastAPI
 from mcp_server.sentinelflow_context.settings import clear_mcp_server_settings_cache
 from pydantic import BaseModel
@@ -43,13 +43,15 @@ class FakeRuntime:
 
     def __init__(
         self,
-        llm: StaticStructuredLLM | None = None,
+        llm: StructuredLLM | None = None,
         *,
         wrap_mcp: Callable[[Any], Any] | None = None,
         ready_error: BaseException | None = None,
         session_error: BaseException | None = None,
+        stream_tokens: bool = False,
     ) -> None:
-        self.llm = llm or StaticStructuredLLM(static_llm_responses())
+        self.llm: StructuredLLM = llm or StaticStructuredLLM(static_llm_responses())
+        self.stream_tokens = stream_tokens
         self.wrap_mcp = wrap_mcp
         self.ready_error = ready_error
         self.session_error = session_error
@@ -72,6 +74,7 @@ class FakeRuntime:
                 llm=self.llm,
                 retriever=FakeRetriever(DEFAULT_CHUNKS),
                 enable_retrieval=False,
+                stream_tokens=self.stream_tokens,
             )
 
     def session(self) -> AbstractAsyncContextManager[AnalysisSession]:

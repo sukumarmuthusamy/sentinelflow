@@ -141,17 +141,28 @@ async def test_lifecycle_events_are_recorded_in_order(harness: HarnessFactory) -
     async with harness() as h:
         status = await h.run_to_rest()
         events = h.service.store.events(status["job_id"])
-    assert [event.type for event in events] == [
+    lifecycle = [event for event in events if event.type in LIFECYCLE_EVENT_TYPES]
+    assert [event.type for event in lifecycle] == [
         JobEventType.JOB_QUEUED,
         JobEventType.JOB_RUNNING,
         JobEventType.JOB_COMPLETED,
     ]
-    assert [event.seq for event in events] == [1, 2, 3]
+    # Node events (M5-B) share the log: seq stays gap-free across both families,
+    # and every node event sits between job.running and the terminal event.
+    assert [event.seq for event in events] == list(range(1, len(events) + 1))
+    assert events[1].type is JobEventType.JOB_RUNNING
+    assert events[-1].type is JobEventType.JOB_COMPLETED
+    assert {event.type for event in events[2:-1]} == {
+        JobEventType.NODE_STARTED,
+        JobEventType.NODE_COMPLETED,
+    }
     assert events[-1].data == {"decision": "PASS", "degraded": False}
 
 
-def test_only_lifecycle_events_are_claimed_as_emitted() -> None:
-    """Node and token events are M5-B contracts; nothing may claim they work yet."""
-    assert EMITTED_EVENT_TYPES == LIFECYCLE_EVENT_TYPES
-    assert JobEventType.AGENT_TOKEN not in EMITTED_EVENT_TYPES
-    assert JobEventType.NODE_STARTED not in EMITTED_EVENT_TYPES
+def test_emitted_event_types_match_what_m5b_produces() -> None:
+    """M5-B emits node and live events; nothing is listed that is not produced."""
+    assert LIFECYCLE_EVENT_TYPES < EMITTED_EVENT_TYPES
+    assert JobEventType.NODE_STARTED in EMITTED_EVENT_TYPES
+    assert JobEventType.NODE_COMPLETED in EMITTED_EVENT_TYPES
+    assert JobEventType.AGENT_TOKEN in EMITTED_EVENT_TYPES
+    assert set(EMITTED_EVENT_TYPES) == set(JobEventType)

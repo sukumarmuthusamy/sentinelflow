@@ -92,6 +92,11 @@ class _RaisingStructured:
         self._error = error
         self.attempts = 0
 
+    def with_config(self, **kwargs: object) -> _RaisingStructured:
+        # The gateway tags every structured runnable with run metadata (M5-B).
+        _ = kwargs
+        return self
+
     async def ainvoke(self, messages: object) -> object:
         _ = messages
         self.attempts += 1

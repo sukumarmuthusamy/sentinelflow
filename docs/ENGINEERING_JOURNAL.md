@@ -420,3 +420,37 @@ Tests: `tests/contract/test_github_hardening.py`, `tests/unit/test_github_signal
 Also caught by an existing guard: the domain-vocabulary leak test flagged the word "claim", used for "claiming a job", in `app/jobs` and `app/persistence`. The wording is now "acquire" and "reserve".
 
 Tests: `tests/api/test_errors_and_security.py` and `tests/api/test_approval.py`.
+
+## M5-B streaming: observing the run changed the provider calls, and four ways fragments could mislead or leak
+
+**What looked wrong.** While wiring LangGraph's `messages` stream mode into the executor, a reading of `BaseChatModel._should_stream` showed that *observing* a run changes it. Then the token tests and a test-first pass over the sink turned up four more problems:
+
+- a model that does not stream would produce a fake token;
+- a credential split across chunks would pass a per-chunk filter;
+- a client that disconnects before its first frame would leak its subscription;
+- a lagging client that caught up after the job finished never learned it had lost fragments.
+
+**Investigation.**
+
+- *Provider call path.*
+  - `messages` mode attaches a `_StreamingCallbackHandler`, and LangChain then calls the provider's streaming endpoint instead of the plain one. For Gemini and OpenRouter that is a different HTTP call from the one M4 validated.
+  - `langchain-openai` enables `stream_usage` only for the default OpenAI base URL. With OpenRouter's `base_url`, a streamed response has no usage, so `LLMResult` tokens and the per-analysis token budget would read zero.
+- *Fake tokens.* For a model without streaming (`disable_streaming=True`), LangGraph's `messages` handler still emits the finished `AIMessage` from `on_llm_end`. A translator that accepted any message would have reported a whole response as one "token".
+- *Split credentials.* The fake model streams 5-9 characters per chunk, so an `AIza…` key spans five chunks, and no per-chunk regex can see it. A greedy pattern applied to a partial key redacts the prefix and lets the tail through on the next chunk.
+- *Leaked subscription.* Starlette's `StreamingResponse` cancels its task group on `http.disconnect`. If that happens before the first frame, the async generator never starts, so its `finally` never runs.
+- *Lost gap notice.* Recovery after lag re-read durable events from the store and returned as soon as it delivered `job.completed`, before emitting `stream.gap`. The slow-client test caught it: all durable events arrived and no gap was reported.
+
+**Root cause.** Streaming is not a passive tap: it changes which provider API is called, it reports non-streamed output as messages, and it moves data out in pieces, which defeats checks that look at one piece at a time.
+
+**Decision.**
+
+- *Token streaming is opt-in.*
+  - `API_STREAM_TOKENS` defaults to false. Node and lifecycle events always stream, and they need no provider change.
+  - The OpenRouter client sets `stream_usage=True`, which affects only streamed calls.
+  - Live streaming is documented as unverified (ADR-0003). No paid call was made to verify it.
+- *Only real chunks.* A fragment is forwarded only if it is an `AIMessageChunk` from a run the gateway tagged as structured output. Thinking blocks are dropped. A `disable_streaming` test pins that a non-streaming model yields zero fragments and that the model really answered.
+- *Redaction window.* Redaction runs over a 128-character held-back window per response. A match that touches the end of the buffer is held whole until it can no longer grow, and a private-key block is held until its END line. A randomized-chunking test feeds six credential shapes in 1-12 character pieces and checks that neither the key nor its tail is emitted. The cost: fragments arrive up to 128 characters late and are re-chunked, which the event contract states.
+- *Subscription release.* `EventStreamResponse.__call__` closes the subscription in its own `finally`, which runs whether or not the generator started.
+- *Gap first.* Recovery emits `stream.gap` before the re-read durable events, which is also where the loss happened.
+
+Tests: `tests/api/test_events_stream.py`, `tests/graph/test_graph_streaming.py`, `tests/unit/test_stream_policy.py`.

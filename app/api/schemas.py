@@ -84,6 +84,7 @@ class JobLinks(BaseModel):
     self: str
     result: str | None = None
     approval: str | None = None
+    events: str | None = None
 
 
 class JobView(BaseModel):
@@ -113,6 +114,7 @@ class JobView(BaseModel):
                 self=base,
                 result=f"{base}/decision",
                 approval=f"{base}/approval" if job.request.get("record_decision") else None,
+                events=f"{base}/events",
             )
         else:
             base = f"/v1/evaluations/{job.job_id}"

@@ -11,6 +11,10 @@ threads *and* processes that share the file:
 * every status transition, a compare-and-set on the current status that writes the
   matching lifecycle events in the same transaction.
 
+Every committed event is handed to the optional ``listener`` after its transaction
+commits (never for a rolled-back write). The job service uses it to fan durable
+events out to live SSE subscribers; the store itself stays transport-agnostic.
+
 What this does **not** give is ownership of execution. A job runs as an asyncio task
 in the process that accepted it, and the store has no lease or heartbeat. Startup
 recovery (``JobService.recover``) assumes one API process per database file.
@@ -20,7 +24,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -77,6 +81,9 @@ _UNSET: Any = object()
 # every value is bound as a parameter.
 
 EventSpec = tuple[JobEventType, dict[str, Any]]
+# Called with the events of one committed write, in seq order. It must not block:
+# it may run on a worker thread.
+EventListener = Callable[[Sequence[JobEvent]], None]
 
 
 def utc_now() -> datetime:
@@ -113,6 +120,14 @@ class SqliteJobStore:
     def __init__(self, path: Path, *, busy_timeout_seconds: float = 10.0) -> None:
         self._path = path
         self._timeout = busy_timeout_seconds
+        self._listener: EventListener | None = None
+
+    def set_listener(self, listener: EventListener | None) -> None:
+        self._listener = listener
+
+    def _notify(self, events: Sequence[JobEvent]) -> None:
+        if events and self._listener is not None:
+            self._listener(events)
 
     @property
     def path(self) -> Path:
@@ -171,16 +186,15 @@ class SqliteJobStore:
                 "SELECT * FROM job_events WHERE job_id = ? AND seq > ? ORDER BY seq",
                 (job_id, after_seq),
             ).fetchall()
-        return [
-            JobEvent(
-                job_id=row["job_id"],
-                seq=row["seq"],
-                type=JobEventType(row["type"]),
-                at=datetime.fromisoformat(row["at"]),
-                data=json.loads(row["data_json"]),
-            )
-            for row in rows
-        ]
+        return [_event(row) for row in rows]
+
+    def last_seq(self, job_id: str) -> int:
+        with closing(self._connect()) as conn:
+            (last,) = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM job_events WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        return int(last)
 
     # -- writes ----------------------------------------------------------------
 
@@ -240,7 +254,13 @@ class SqliteJobStore:
                     _iso(record.updated_at),
                 ),
             )
-            _append_events(conn, record.job_id, [(JobEventType.JOB_QUEUED, {})], record.created_at)
+            written = _append_events(
+                conn,
+                record.job_id,
+                [(JobEventType.JOB_QUEUED, {})],
+                record.created_at,
+            )
+        self._notify(written)
         return CreateOutcome(record=record, created=True)
 
     def transition(
@@ -291,9 +311,31 @@ class SqliteJobStore:
             )
             if cursor.rowcount != 1:
                 return None
-            _append_events(conn, job_id, events, now)
+            written = _append_events(conn, job_id, events, now)
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        self._notify(written)
         return _record(row)
+
+    def append_events(
+        self,
+        job_id: str,
+        events: Sequence[EventSpec],
+        *,
+        require_status: JobStatus = JobStatus.RUNNING,
+    ) -> list[JobEvent] | None:
+        """Append progress events while the job is in ``require_status``.
+
+        Returns the written events, or ``None`` (nothing written) once the job has
+        left that status: a run that was marked failed or interrupted cannot keep
+        adding node events after its terminal event.
+        """
+        with self._write() as conn:
+            row = conn.execute("SELECT status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None or row["status"] != require_status.value:
+                return None
+            written = _append_events(conn, job_id, events, utc_now())
+        self._notify(written)
+        return written
 
 
 def _append_events(
@@ -301,16 +343,38 @@ def _append_events(
     job_id: str,
     events: Sequence[EventSpec],
     at: datetime,
-) -> None:
+) -> list[JobEvent]:
     (last,) = conn.execute(
         "SELECT COALESCE(MAX(seq), 0) FROM job_events WHERE job_id = ?",
         (job_id,),
     ).fetchone()
+    written: list[JobEvent] = []
     for offset, (event_type, data) in enumerate(events, start=1):
+        encoded = _json(data) or "{}"
         conn.execute(
             "INSERT INTO job_events (job_id, seq, type, at, data_json) VALUES (?, ?, ?, ?, ?)",
-            (job_id, last + offset, event_type.value, _iso(at), _json(data) or "{}"),
+            (job_id, last + offset, event_type.value, _iso(at), encoded),
         )
+        written.append(
+            JobEvent(
+                job_id=job_id,
+                seq=last + offset,
+                type=event_type,
+                at=at,
+                data=json.loads(encoded),
+            ),
+        )
+    return written
+
+
+def _event(row: sqlite3.Row) -> JobEvent:
+    return JobEvent(
+        job_id=row["job_id"],
+        seq=row["seq"],
+        type=JobEventType(row["type"]),
+        at=datetime.fromisoformat(row["at"]),
+        data=json.loads(row["data_json"]),
+    )
 
 
 def _record(row: sqlite3.Row) -> JobRecord:

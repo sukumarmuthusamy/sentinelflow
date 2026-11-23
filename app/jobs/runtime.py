@@ -5,8 +5,9 @@ in-process MCP client, the routing LLM gateway and (inside ``run_analysis``) the
 retrieval service. Tests inject a runtime with a static LLM and a fake retriever.
 
 ``GraphExecutor`` is the only module that calls ``run_analysis`` /
-``resume_analysis``. M5-B swaps their ``ainvoke`` for ``astream`` here, behind the
-same ``start`` / ``resume`` calls, without touching the job service or the routes.
+``resume_analysis``. Given an event handler it observes the run through LangGraph's
+stream (M5-B), still one execution. Either way, the outcome it reports is read back
+from the thread's stored checkpoint, not taken from the in-memory return value.
 """
 
 from __future__ import annotations
@@ -19,8 +20,9 @@ from typing import Any, Protocol
 from app.core.errors import ErrorCode, SentinelFlowError
 from app.core.settings import Settings
 from app.graph.context import EvidenceRetriever
-from app.graph.runner import resume_analysis, run_analysis
+from app.graph.runner import read_checkpoint, resume_analysis, run_analysis
 from app.graph.state import AnalysisRequest
+from app.graph.streaming import INTERRUPT_KEY, GraphEventHandler
 from app.mcp_client.port import McpClientPort
 from app.model_gateway.llm import (
     GeminiStructuredLLM,
@@ -40,6 +42,9 @@ class AnalysisSession:
     llm: StructuredLLM
     retriever: EvidenceRetriever | None = None
     enable_retrieval: bool = True
+    # Forward structured-output fragments (LangGraph "messages" mode). It makes the
+    # chat models call their providers' streaming APIs, so it is opt-in.
+    stream_tokens: bool = False
 
 
 class AnalysisRuntime(Protocol):
@@ -121,7 +126,12 @@ class DefaultAnalysisRuntime:
         from app.mcp_client import SentinelFlowMcpAdapter
 
         async with SentinelFlowMcpAdapter(context_server) as adapter:
-            yield AnalysisSession(mcp=adapter, llm=self._gateway(), enable_retrieval=True)
+            yield AnalysisSession(
+                mcp=adapter,
+                llm=self._gateway(),
+                enable_retrieval=True,
+                stream_tokens=self._settings.api_stream_tokens,
+            )
 
     def session(self) -> AbstractAsyncContextManager[AnalysisSession]:
         return self._open()
@@ -129,13 +139,19 @@ class DefaultAnalysisRuntime:
 
 @dataclass(frozen=True)
 class GraphOutcome:
-    """Final or interrupted graph state after one execution."""
+    """The thread's stored checkpoint after one execution."""
 
     state: dict[str, Any]
+    next_nodes: tuple[str, ...] = ()
 
     @property
     def interrupted(self) -> bool:
-        return bool(self.state.get("__interrupt__"))
+        return bool(self.state.get(INTERRUPT_KEY))
+
+    @property
+    def finished(self) -> bool:
+        """The graph reached END: no pending node and no pending interrupt."""
+        return not self.next_nodes and not self.interrupted
 
 
 class GraphExecutor:
@@ -151,9 +167,10 @@ class GraphExecutor:
         *,
         thread_id: str,
         analysis_id: str,
+        on_event: GraphEventHandler | None = None,
     ) -> GraphOutcome:
         async with self._runtime.session() as session:
-            state = await run_analysis(
+            await run_analysis(
                 request,
                 mcp=session.mcp,
                 llm=session.llm,
@@ -162,8 +179,10 @@ class GraphExecutor:
                 settings=self._settings,
                 enable_retrieval=session.enable_retrieval,
                 retriever=session.retriever,
+                on_event=on_event,
+                stream_tokens=session.stream_tokens and on_event is not None,
             )
-        return GraphOutcome(state=state)
+        return await self._stored_outcome(thread_id)
 
     async def resume(
         self,
@@ -171,6 +190,7 @@ class GraphExecutor:
         *,
         thread_id: str,
         approved: bool,
+        on_event: GraphEventHandler | None = None,
     ) -> GraphOutcome:
         """Resume the interrupt on the original thread (counters restored by the runner).
 
@@ -178,7 +198,7 @@ class GraphExecutor:
         the job record, so nothing a client sends can reach graph state.
         """
         async with self._runtime.session() as session:
-            state = await resume_analysis(
+            await resume_analysis(
                 mcp=session.mcp,
                 llm=session.llm,
                 thread_id=thread_id,
@@ -187,5 +207,13 @@ class GraphExecutor:
                 settings=self._settings,
                 enable_retrieval=session.enable_retrieval,
                 retriever=session.retriever,
+                on_event=on_event,
+                stream_tokens=session.stream_tokens and on_event is not None,
             )
-        return GraphOutcome(state=state)
+        return await self._stored_outcome(thread_id)
+
+    async def _stored_outcome(self, thread_id: str) -> GraphOutcome:
+        """What the checkpointer durably holds (``durability="sync"``), not what the
+        stream happened to report: the job is settled from this."""
+        snapshot = await read_checkpoint(thread_id=thread_id, settings=self._settings)
+        return GraphOutcome(state=snapshot.state, next_nodes=snapshot.next_nodes)

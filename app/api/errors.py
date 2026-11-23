@@ -41,6 +41,7 @@ HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.APPROVAL_NOT_REQUIRED: 409,
     ErrorCode.APPROVAL_ALREADY_SUBMITTED: 409,
     ErrorCode.RESULT_NOT_AVAILABLE: 409,
+    ErrorCode.TOO_MANY_SUBSCRIBERS: 429,
     ErrorCode.INTERNAL_ERROR: 500,
 }
 
@@ -56,6 +57,7 @@ _SAFE_DETAIL_KEYS = frozenset(
         "job_id",
         "limit_bytes",
         "max_active_jobs",
+        "max_subscribers",
         "missing_settings",
         "source",
         "status",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -17,6 +18,7 @@ from app.graph.budget import AnalysisBudget
 from app.graph.build import build_analysis_graph
 from app.graph.context import AnalysisGraphContext, EvidenceRetriever
 from app.graph.state import AnalysisRequest
+from app.graph.streaming import INTERRUPT_KEY, GraphEventHandler, stream_graph
 from app.graph.typed_state import GraphState
 from app.mcp_client.port import McpClientPort
 from app.mcp_client.source_binding import bind_change_source
@@ -142,8 +144,15 @@ async def run_analysis(
     settings: Settings | None = None,
     enable_retrieval: bool = True,
     retriever: EvidenceRetriever | None = None,
+    on_event: GraphEventHandler | None = None,
+    stream_tokens: bool = False,
 ) -> dict[str, Any]:
-    """Execute the graph until completion or interrupt."""
+    """Execute the graph until completion or interrupt.
+
+    With ``on_event`` the same single execution is observed through LangGraph's
+    stream (``app.graph.streaming``) and the return value is unchanged. Without it,
+    this is the M4 ``ainvoke`` path, byte for byte.
+    """
     cfg = settings or get_settings()
     context, owned = await build_analysis_context(
         request,
@@ -164,6 +173,14 @@ async def run_analysis(
         async with _checkpointer(cfg.graph_checkpoint_path) as checkpointer:
             compiled = build_analysis_graph(cfg).compile(checkpointer=checkpointer)
             state_in = cast(GraphState, _initial_state(request, analysis_id))
+            if on_event is not None:
+                return await stream_graph(
+                    compiled,
+                    state_in,
+                    config,
+                    on_event=on_event,
+                    stream_tokens=stream_tokens,
+                )
             result: dict[str, Any] = await compiled.ainvoke(
                 state_in,
                 config=config,
@@ -185,8 +202,10 @@ async def resume_analysis(
     settings: Settings | None = None,
     enable_retrieval: bool = True,
     retriever: EvidenceRetriever | None = None,
+    on_event: GraphEventHandler | None = None,
+    stream_tokens: bool = False,
 ) -> dict[str, Any]:
-    """Resume after human approval interrupt."""
+    """Resume after human approval interrupt (``on_event`` as in ``run_analysis``)."""
     cfg = settings or get_settings()
     context, owned = await build_analysis_context(
         request,
@@ -208,11 +227,54 @@ async def resume_analysis(
             compiled = build_analysis_graph(cfg).compile(checkpointer=checkpointer)
             snapshot = await compiled.aget_state(config)
             restore_counters(context, snapshot.values)
-            return await compiled.ainvoke(
+            if on_event is not None:
+                return await stream_graph(
+                    compiled,
+                    Command(resume=resume_payload),
+                    config,
+                    on_event=on_event,
+                    stream_tokens=stream_tokens,
+                )
+            resumed: dict[str, Any] = await compiled.ainvoke(
                 Command(resume=resume_payload),
                 config=config,
                 durability="sync",
             )
+            return resumed
     finally:
         if owned is not None:
             await owned.close()
+
+
+@dataclass(frozen=True)
+class CheckpointSnapshot:
+    """The thread's latest durable checkpoint, shaped like a run's return value."""
+
+    state: dict[str, Any]
+    next_nodes: tuple[str, ...]
+
+    @property
+    def interrupted(self) -> bool:
+        return bool(self.state.get(INTERRUPT_KEY))
+
+    @property
+    def finished(self) -> bool:
+        """No pending node and no pending interrupt: the graph reached END."""
+        return not self.next_nodes and not self.interrupted
+
+
+async def read_checkpoint(
+    *,
+    thread_id: str,
+    settings: Settings | None = None,
+) -> CheckpointSnapshot:
+    """Read what the checkpointer actually stored for ``thread_id`` (no node runs)."""
+    cfg = settings or get_settings()
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    async with _checkpointer(cfg.graph_checkpoint_path) as checkpointer:
+        compiled = build_analysis_graph(cfg).compile(checkpointer=checkpointer)
+        snapshot = await compiled.aget_state(config)
+    state: dict[str, Any] = dict(snapshot.values or {})
+    if snapshot.interrupts:
+        state[INTERRUPT_KEY] = list(snapshot.interrupts)
+    return CheckpointSnapshot(state=state, next_nodes=tuple(snapshot.next or ()))

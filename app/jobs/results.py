@@ -193,6 +193,9 @@ _FAILURE_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.DECISION_INVARIANT_VIOLATED: (
         "The resumed run reported a different decision than the one shown for approval."
     ),
+    ErrorCode.GRAPH_INCOMPLETE: (
+        "The run ended without reaching the end of the graph or an approval interrupt."
+    ),
 }
 
 

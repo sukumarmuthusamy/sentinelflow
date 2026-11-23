@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from app.jobs.events import JobEventType
+from app.jobs.events import LIFECYCLE_EVENT_TYPES, JobEventType
 from app.model_gateway.llm import StaticStructuredLLM
 
 from tests.api.conftest import BlockingLLM, FakeRuntime, HarnessFactory, api_settings
@@ -47,7 +47,11 @@ async def test_gated_analysis_waits_then_records_once(harness: HarnessFactory) -
 
         done = (await h.client.get(f"/v1/analyses/{job_id}")).json()
         after = (await h.client.get(f"/v1/analyses/{job_id}/decision")).json()
-        events = [event.type for event in h.service.store.events(job_id)]
+        events = [
+            event.type
+            for event in h.service.store.events(job_id)
+            if event.type in LIFECYCLE_EVENT_TYPES
+        ]
 
     assert done["status"] == "completed"
     assert done["run_count"] == 2

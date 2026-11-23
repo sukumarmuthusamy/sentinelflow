@@ -3,6 +3,7 @@
 Routes only translate HTTP to ``JobService`` calls. Creation returns ``202`` with a
 ``Location`` header. A replay of an idempotent create returns ``200`` with
 ``Idempotent-Replayed: true`` and the original job, whatever its status now.
+``GET /v1/analyses/{id}/events`` is a Server-Sent Events stream (M5-B).
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from app.api.schemas import (
     JobView,
 )
 from app.api.security import require_api_access
+from app.api.sse import EventStreamResponse
 from app.core.errors import ErrorCode, SentinelFlowError
 from app.jobs.evaluation import EvaluationResult
 from app.jobs.models import JobKind
@@ -32,6 +34,7 @@ from app.persistence.job_store import CreateOutcome
 
 JOB_ID_PATTERN = r"^job-[0-9a-f]{32}$"
 _KEY = re.compile(IDEMPOTENCY_KEY_PATTERN)
+_LAST_EVENT_ID = re.compile(r"^[0-9]{1,12}$")
 
 _ERRORS: dict[int | str, dict[str, object]] = {
     code: {"model": ErrorResponse} for code in (401, 403, 404, 409, 413, 422, 429, 503)
@@ -45,6 +48,15 @@ IdempotencyKey = Annotated[
     Header(
         alias="Idempotency-Key",
         description="1-128 chars of [A-Za-z0-9._:-]; same key + same body = same job",
+    ),
+]
+
+
+LastEventId = Annotated[
+    str | None,
+    Header(
+        alias="Last-Event-ID",
+        description="seq of the last durable event received; replay starts after it",
     ),
 ]
 
@@ -113,6 +125,43 @@ async def get_decision(job_id: JobIdPath, service: Service) -> DecisionView:
         status=job.status,
         result=AnalysisResult.model_validate(job.result),
     )
+
+
+def _after_seq(raw: str | None) -> int:
+    if raw is None or raw == "":
+        return 0
+    if not _LAST_EVENT_ID.match(raw.strip()):
+        raise SentinelFlowError(
+            "Last-Event-ID must be a non-negative integer event id",
+            code=ErrorCode.INVALID_REQUEST,
+            details={"field": "Last-Event-ID"},
+        )
+    return int(raw.strip())
+
+
+@router.get(
+    "/analyses/{job_id}/events",
+    response_class=EventStreamResponse,
+    responses={
+        200: {
+            "content": {"text/event-stream": {}},
+            "description": (
+                "Server-Sent Events. Durable events (job.*, node.*) carry `id:` = seq "
+                "and are replayed after Last-Event-ID; agent.token and stream.gap are "
+                "live-only and carry no id. The stream ends after job.completed or "
+                "job.failed and stays open while waiting for approval."
+            ),
+        },
+    },
+)
+async def stream_analysis_events(
+    job_id: JobIdPath,
+    service: Service,
+    last_event_id: LastEventId = None,
+) -> EventStreamResponse:
+    after_seq = _after_seq(last_event_id)
+    stream = await service.open_event_stream(job_id, after_seq=after_seq)
+    return EventStreamResponse(stream)
 
 
 @router.post(
