@@ -55,6 +55,7 @@ _SAFE_DETAIL_KEYS = frozenset(
         "errors",
         "field",
         "job_id",
+        "latest_event_id",
         "limit_bytes",
         "max_active_jobs",
         "max_subscribers",

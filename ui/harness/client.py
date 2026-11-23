@@ -14,13 +14,13 @@ browser session holds at most one subscription, and only while it is reading.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import time
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 
@@ -96,9 +96,58 @@ def validate_job_id(job_id: str) -> str:
     return value
 
 
+def _is_loopback_host(host: str) -> bool:
+    """``localhost`` or a literal loopback IP. A DNS name never counts: it can resolve
+    anywhere, so ``127.example.com`` and ``localhost.example.com`` are remote."""
+    host = host.lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _parse_url(url: str) -> httpx.URL | None:
+    # httpx's own parser, so the host checked is the host httpx would connect to.
+    try:
+        return httpx.URL(url.strip())
+    except (httpx.InvalidURL, TypeError, ValueError):
+        return None
+
+
 def is_loopback_url(base_url: str) -> bool:
-    host = (urlsplit(base_url).hostname or "").lower()
-    return host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127.")
+    url = _parse_url(base_url)
+    return url is not None and _is_loopback_host(url.host)
+
+
+def _key_transport_allowed(url: httpx.URL) -> bool:
+    return url.scheme.lower() == "https" or _is_loopback_host(url.host)
+
+
+INSECURE_KEY_MESSAGE = (
+    "An API key is sent only over https:// or to a loopback address "
+    "(127.0.0.1, ::1, localhost). Use an https:// URL for this host, or clear the key."
+)
+
+
+def require_safe_key_transport(base_url: str, api_key: str | None) -> None:
+    """Refuse an API key bound for a plaintext, non-loopback URL. Nothing is sent.
+
+    Raises ``ApiError`` with code ``INSECURE_API_URL``; the message never contains
+    the key.
+    """
+    if not api_key:
+        return
+    url = _parse_url(base_url)
+    if url is None or not _key_transport_allowed(url):
+        raise ApiError(status=0, code="INSECURE_API_URL", message=INSECURE_KEY_MESSAGE)
+
+
+def _guard_key_transport(request: httpx.Request) -> None:
+    # Checked again on every request, against the URL actually about to be sent.
+    if "authorization" in request.headers and not _key_transport_allowed(request.url):
+        raise ApiError(status=0, code="INSECURE_API_URL", message=INSECURE_KEY_MESSAGE)
 
 
 class SentinelFlowClient:
@@ -110,6 +159,7 @@ class SentinelFlowClient:
         timeout_seconds: float = 10.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        require_safe_key_transport(base_url, api_key)
         self.base_url = base_url.rstrip("/")
         headers = {"Accept": "application/json"}
         if api_key:
@@ -121,6 +171,7 @@ class SentinelFlowClient:
             timeout=timeout_seconds,
             transport=transport,
             follow_redirects=False,
+            event_hooks={"request": [_guard_key_transport]},
         )
 
     def close(self) -> None:

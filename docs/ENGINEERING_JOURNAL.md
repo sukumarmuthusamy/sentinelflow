@@ -508,3 +508,22 @@ Tests: `tests/unit/test_stream_redaction.py`, `tests/unit/test_usage_accounting.
 - The copy now says the job status only means the run finished. The override moved into the gate panel, and status and stage are compact badges.
 
 Tests: `tests/ui/` (HTTP client on a real socket, session model, HTTP-only boundary, Streamlit `AppTest` page tests).
+
+## M5 final review fixes: a loopback check that trusted a hostname prefix
+
+**What looked wrong.** The final review found that the harness would send `Authorization: Bearer <key>` in cleartext to any `http://` host, with only a sidebar warning. Its loopback test also accepted `http://127.evil.com:8000`.
+
+**Investigation.** `is_loopback_url` matched `host.startswith("127.")`, a text test on a name that DNS can point anywhere. The warning was only advisory: the comparison was case-sensitive (`HTTP://` skipped it) and every click and background poll still sent the header. Both reproduced with an injected transport recording the header.
+
+**Root cause.** The safety decision lived in the page as a hint, not in the client as a rule, and it judged a hostname by its spelling instead of parsing an address.
+
+**Decision.**
+
+- Loopback is the exact name `localhost` or a literal address whose `ipaddress` value is loopback. The host comes from `httpx.URL`, the parser that decides where the request goes.
+- `SentinelFlowClient` refuses an API key for any URL that is neither `https://` nor loopback (`INSECURE_API_URL`), when built and again in a request hook, before anything is sent. Redirects stay off.
+- The page shows that error and stops rendering the workspace, so no client is built and nothing is sent.
+- Two small fixes from the same review:
+  - the verdict in the HTML decision card is escaped;
+  - `latest_event_id` is now on the error-detail allowlist, so a future-cursor 422 carries it as ADR-0003 already documented.
+
+Tests: `tests/ui/test_key_transport.py`; `tests/api/test_events_stream.py::test_future_cursor_on_an_active_job_is_refused`.

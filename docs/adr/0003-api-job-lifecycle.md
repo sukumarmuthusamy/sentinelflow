@@ -179,9 +179,9 @@ Node inputs, errors and interrupt payloads are dropped in translation, so nothin
   - No background thread touches Streamlit.
 - **Replay-safe rendering.** Durable events are keyed by `seq` and fragments by `(run, index)`, so a replay after a reconnect adds no rows. Fragments that arrived while the page was not reading are counted from index gaps and shown as "not received", never reconstructed. Fragments are labelled provisional; the decision panel shows only `GET /decision`.
 - **Decision provenance.** The page shows the deterministic gate (risk score, confidence, override, matched conditions, component scores) apart from the LLM agents' supporting analysis (impacted services, cited findings, recommended tests). It keeps job status and release decision visibly separate.
-- **Errors.** The page shows the API's error code, message and request id. A body that is not the SentinelFlow envelope is reported by status only, never echoed. An unreachable API gets one actionable message. `python -m ui.harness` binds 127.0.0.1, disables usage statistics and hides Streamlit error details.
+- **Errors.** The page shows the API's error code, message and request id. A body that is not the SentinelFlow envelope is reported by status only, never echoed. An unreachable API gets one actionable message. The client sends an API key only over `https://` or to `localhost` or a literal loopback IP; any other URL is refused with `INSECURE_API_URL` before connecting, checked when the client is built and again on each request. DNS names such as `127.example.com` never count as loopback, and redirects are not followed. `python -m ui.harness` binds 127.0.0.1, disables usage statistics and hides Streamlit error details.
 
-**Not covered.** Fragments emitted between two reads are lost to that page, by design of the live-only contract. An installed `API_KEY` is sent only as a Bearer header; the UI warns when that would cross a non-loopback plain-HTTP link but does not refuse. The UI has no job list (the API has none) and no cancel or retry.
+**Not covered.** Fragments emitted between two reads are lost to that page, by design of the live-only contract. The UI has no job list (the API has none) and no cancel or retry.
 
 ## Consequences
 

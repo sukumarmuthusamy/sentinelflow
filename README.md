@@ -406,7 +406,7 @@ $env:SENTINELFLOW_API_KEY = "<only if the server sets API_KEY>"
 uv run --extra ui python -m ui.harness
 ```
 
-The key can also be typed into the sidebar's password field; it stays in that browser session and is never displayed. `python -m ui.harness` binds 127.0.0.1, turns off Streamlit usage statistics and hides error details. `.streamlit/config.toml` does the same for `streamlit run ui/streamlit_app.py`.
+The key can also be typed into the sidebar's password field; it stays in that browser session and is never displayed. The harness sends a key only over `https://` or to a loopback address (`127.0.0.1`, `::1`, `localhost`); for any other `http://` URL it shows `INSECURE_API_URL` and sends nothing. `python -m ui.harness` binds 127.0.0.1, turns off Streamlit usage statistics and hides error details. `.streamlit/config.toml` does the same for `streamlit run ui/streamlit_app.py`.
 
 **Local demo (offline, no credentials).**
 

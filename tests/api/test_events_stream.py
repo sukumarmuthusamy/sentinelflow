@@ -8,6 +8,7 @@ chunks, so every ``agent.token`` here was produced by a real ``astream`` chunk.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -730,13 +731,18 @@ async def test_future_cursor_on_an_active_job_is_refused(harness: HarnessFactory
             body = bytes(sse.body).decode("utf-8")
         async with _sse(h, job_id, **{"Last-Event-ID": str(last + 1)}) as sse:
             next_status = sse.status
+            next_body = bytes(sse.body).decode("utf-8")
         assert h.service.bus.subscriber_count(job_id) == 0
         llm.release()
         await h.idle()
     assert status == 422
-    assert '"code":"INVALID_REQUEST"' in body.replace(" ", "")
-    assert '"field":"Last-Event-ID"' in body.replace(" ", "")
+    error = json.loads(body)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    # Review L2: the latest committed id survives the details allowlist, so a client
+    # can resume from it.
+    assert error["details"] == {"field": "Last-Event-ID", "latest_event_id": last}
     assert next_status == 422  # even one past the latest committed event
+    assert json.loads(next_body)["error"]["details"]["latest_event_id"] == last
 
 
 @pytest.mark.parametrize("outcome", ["completed", "failed"])

@@ -16,6 +16,7 @@ Execution model (ADR-0003 "Harness UI"):
 
 from __future__ import annotations
 
+import html
 import os
 from datetime import datetime
 from typing import Any
@@ -26,7 +27,7 @@ from ui.harness.client import (
     ApiError,
     ApiUnavailableError,
     SentinelFlowClient,
-    is_loopback_url,
+    require_safe_key_transport,
     validate_job_id,
 )
 from ui.harness.progress import (
@@ -128,7 +129,7 @@ def _select_job(job: dict[str, Any]) -> None:
 # -- connection -------------------------------------------------------------------------
 
 
-def _connection() -> tuple[str, str | None]:
+def _connection() -> tuple[str, str | None, ApiError | None]:
     with st.sidebar:
         st.markdown("### API connection")
         base_url = st.text_input(
@@ -148,9 +149,14 @@ def _connection() -> tuple[str, str | None]:
         api_key = typed_key.strip() or env_key or None
         if api_key and not typed_key.strip():
             st.caption("Using the API key from SENTINELFLOW_API_KEY.")
-        if api_key and base_url.startswith("http://") and not is_loopback_url(base_url):
-            st.warning("The API key would be sent unencrypted to a non-loopback host.")
-        if st.button("Check connection", key="check_connection"):
+        # The client refuses this too; checking here turns it into a message, not a crash.
+        insecure: ApiError | None = None
+        try:
+            require_safe_key_transport(base_url, api_key)
+        except ApiError as exc:
+            insecure = exc
+            _show_error(exc)
+        if st.button("Check connection", key="check_connection") and insecure is None:
             with SentinelFlowClient(base_url, api_key=api_key, timeout_seconds=3) as client:
                 try:
                     health = client.health()
@@ -166,7 +172,7 @@ def _connection() -> tuple[str, str | None]:
             "server.</span>",
             unsafe_allow_html=True,
         )
-    return base_url, api_key
+    return base_url, api_key, insecure
 
 
 def _describe(exc: ApiError | ApiUnavailableError) -> str:
@@ -506,7 +512,8 @@ def _decision_panel(job: dict[str, Any], decision: dict[str, Any]) -> None:
     st.markdown(
         f"<div class='sf-decision' style='background:{color}'>"
         f"<div class='label'>Deterministic release gate</div>"
-        f"<div class='value'>{verdict}</div><div class='note'>{note}</div></div>",
+        f"<div class='value'>{html.escape(verdict)}</div>"
+        f"<div class='note'>{html.escape(note)}</div></div>",
         unsafe_allow_html=True,
     )
     metrics = st.columns(3)
@@ -787,9 +794,12 @@ def main() -> None:
     )
     st.markdown(_CSS, unsafe_allow_html=True)
     _state()
-    base_url, api_key = _connection()
+    base_url, api_key, insecure = _connection()
     st.title("SentinelFlow")
     st.caption("Release-risk analysis harness · every action goes through the HTTP API")
+    if insecure is not None:
+        _show_error(insecure, context="Connection settings")
+        st.stop()  # nothing below may build a client or send the key
     with _client(base_url, api_key) as client:
         analysis, evaluation = st.tabs(["Release analysis", "Evaluation"])
         with analysis:
