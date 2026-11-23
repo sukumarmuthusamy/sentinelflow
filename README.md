@@ -10,7 +10,7 @@ SentinelFlow ingests a proposed software change and produces an **evidence-cited
 | **M1** | Complete | Deterministic signal layer: import graph, blast radius, oasdiff/buf, security scanners, risk engine, policy gate |
 | **M2** | Complete | `sentinelflow-context` MCP server (7 tools, 3 resources), typed client adapter |
 | **M3** | Complete | Hybrid RAG, pgvector + Qdrant adapters, Gemini embeddings, reranker ablation (none vs Voyage), eval harness |
-| **M4** | In progress | LangGraph workflow, five agents, triage planner, checkpoint + interrupt; live sample passed on an OpenRouter stand-in model (100% citation validity, 10 trajectories) |
+| **M4** | In review | LangGraph workflow, five agents, triage planner, checkpoint + approval interrupt. A post-hardening live check ran on an OpenRouter stand-in model across 4 fixtures: both expected BLOCKs held, the 2 expected PASS fixtures returned REVIEW, and 0 invalid citations survived. Evidence coverage was 0% on the templated corpus. The primary Gemini model is not yet evaluated |
 
 Canonical architecture and roadmap: [SENTINELFLOW_PLAN.md](SENTINELFLOW_PLAN.md).  
 Real obstacles and tradeoffs from M0–M3: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
