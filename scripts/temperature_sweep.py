@@ -24,7 +24,13 @@ from app.model_gateway.errors import (
     is_quota_or_rate_limit_error,
     is_transient_api_error,
 )
-from app.model_gateway.llm import GeminiStructuredLLM, StructuredOutputError
+from app.model_gateway.llm import (
+    GeminiStructuredLLM,
+    OpenRouterStructuredLLM,
+    StructuredLLM,
+    StructuredOutputError,
+    is_openrouter_model,
+)
 from app.model_gateway.pacing import (
     AsyncMinIntervalPacer,
     estimate_paced_wall_seconds,
@@ -82,20 +88,22 @@ async def _one_attempt(
     *,
     temperature: float,
     user_prompt: str,
-    llm: GeminiStructuredLLM,
+    llm: StructuredLLM,
     model: str,
     pacer: AsyncMinIntervalPacer,
     quota_retry_wait_seconds: float,
 ) -> AttemptResult:
     await pacer.wait_turn()
     try:
-        impact = (await llm.generate(
-            model=model,
-            temperature=temperature,
-            system_prompt=prompts.CHANGE_ANALYST_SYSTEM,
-            user_prompt=user_prompt,
-            schema=ChangeImpact,
-        )).value
+        impact = (
+            await llm.generate(
+                model=model,
+                temperature=temperature,
+                system_prompt=prompts.CHANGE_ANALYST_SYSTEM,
+                user_prompt=user_prompt,
+                schema=ChangeImpact,
+            )
+        ).value
         ChangeImpact.model_validate(impact.model_dump())
     except (ValidationError, StructuredOutputError) as exc:
         return AttemptResult(AttemptOutcome.INVALID, str(exc)[:200])
@@ -111,13 +119,15 @@ async def _one_attempt(
             await asyncio.sleep(quota_retry_wait_seconds)
             try:
                 await pacer.wait_turn()
-                impact = (await llm.generate(
-                    model=model,
-                    temperature=temperature,
-                    system_prompt=prompts.CHANGE_ANALYST_SYSTEM,
-                    user_prompt=user_prompt,
-                    schema=ChangeImpact,
-                )).value
+                impact = (
+                    await llm.generate(
+                        model=model,
+                        temperature=temperature,
+                        system_prompt=prompts.CHANGE_ANALYST_SYSTEM,
+                        user_prompt=user_prompt,
+                        schema=ChangeImpact,
+                    )
+                ).value
                 ChangeImpact.model_validate(impact.model_dump())
                 return AttemptResult(AttemptOutcome.OK)
             except Exception as retry_exc:  # noqa: BLE001
@@ -133,13 +143,15 @@ async def _one_attempt(
             await asyncio.sleep(15.0)
             try:
                 await pacer.wait_turn()
-                impact = (await llm.generate(
-                    model=model,
-                    temperature=temperature,
-                    system_prompt=prompts.CHANGE_ANALYST_SYSTEM,
-                    user_prompt=user_prompt,
-                    schema=ChangeImpact,
-                )).value
+                impact = (
+                    await llm.generate(
+                        model=model,
+                        temperature=temperature,
+                        system_prompt=prompts.CHANGE_ANALYST_SYSTEM,
+                        user_prompt=user_prompt,
+                        schema=ChangeImpact,
+                    )
+                ).value
                 ChangeImpact.model_validate(impact.model_dump())
                 return AttemptResult(AttemptOutcome.OK)
             except Exception as retry_exc:  # noqa: BLE001
@@ -161,7 +173,11 @@ async def run_sweep(
     settings = get_settings()
     interval = min_interval_for_rpm(rpm)
     pacer = AsyncMinIntervalPacer(interval)
-    llm = GeminiStructuredLLM(settings=settings, client_max_retries=0)
+    llm: StructuredLLM
+    if is_openrouter_model(model):
+        llm = OpenRouterStructuredLLM(settings=settings, client_max_retries=0)
+    else:
+        llm = GeminiStructuredLLM(settings=settings, client_max_retries=0)
 
     request = AnalysisRequest(change_id=change_id, domain_pack_id=domain_pack_id)
     context_payload = await _fetch_analyst_context(
@@ -299,8 +315,8 @@ def main() -> None:
             ),
         )
     except RuntimeError as exc:
-        if "GEMINI_API_KEY" in str(exc):
-            print("GEMINI_API_KEY missing; sweep not run.", file=sys.stderr)
+        if "GEMINI_API_KEY" in str(exc) or "OPENROUTER_API_KEY" in str(exc):
+            print(f"{exc}; sweep not run.", file=sys.stderr)
             sys.exit(2)
         raise
 

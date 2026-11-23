@@ -94,6 +94,28 @@ async def build_analysis_context(
     )
 
 
+def restore_counters(context: AnalysisGraphContext, values: dict[str, Any]) -> None:
+    """Seed a resumed run's trace and budget from the checkpointed state.
+
+    The context is rebuilt on resume, so without this every post-interrupt node
+    writes zeroed trace metrics over the real ones and the call budget restarts.
+    """
+    trace = values.get("trace_metrics") or {}
+    for name in (
+        "agent_steps",
+        "llm_calls",
+        "mcp_tool_calls",
+        "retrieval_queries",
+        "input_tokens",
+        "output_tokens",
+        "citations_rejected",
+    ):
+        setattr(context.trace, name, int(trace.get(name) or 0))
+    context.budget.llm_calls = context.trace.llm_calls
+    context.budget.input_tokens = context.trace.input_tokens
+    context.budget.output_tokens = context.trace.output_tokens
+
+
 async def run_analysis(
     request: AnalysisRequest,
     *,
@@ -164,6 +186,8 @@ async def resume_analysis(
     try:
         async with _checkpointer(cfg.graph_checkpoint_path) as checkpointer:
             compiled = build_analysis_graph(cfg).compile(checkpointer=checkpointer)
+            snapshot = await compiled.aget_state(config)
+            restore_counters(context, snapshot.values)
             return await compiled.ainvoke(
                 Command(resume=resume_payload),
                 config=config,

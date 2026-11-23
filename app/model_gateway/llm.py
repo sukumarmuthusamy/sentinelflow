@@ -7,8 +7,10 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar, cast
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, ValidationError
 
 from app.core.settings import Settings, get_settings
@@ -56,8 +58,10 @@ def _usage_tokens(raw: object) -> tuple[int, int]:
     return int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
 
 
-class GeminiStructuredLLM:
-    """Google Gemini structured output via langchain-google-genai."""
+class _PacedStructuredLLM:
+    """Shared call path: pacing, transient-only retries, structured parsing, usage."""
+
+    structured_method: str | None = None
 
     def __init__(
         self,
@@ -68,9 +72,9 @@ class GeminiStructuredLLM:
         transient_retries: int = 0,
         transient_backoff_seconds: float = 20.0,
     ) -> None:
-        """Pass client_max_retries=0 in eval scripts to disable SDK tenacity bursts.
+        """Pass client_max_retries=0 in eval scripts to disable SDK retry bursts.
 
-        pacer spaces call starts (shared across parallel agents) to stay under a
+        ``pacer`` spaces call starts (shared across parallel agents) to stay under a
         provider RPM limit; without it, parallel fan-out bursts straight into 429s.
         """
         self._settings = settings or get_settings()
@@ -78,6 +82,9 @@ class GeminiStructuredLLM:
         self._pacer = pacer
         self._transient_retries = transient_retries
         self._transient_backoff = transient_backoff_seconds
+
+    def _chat_model(self, *, model: str, temperature: float) -> BaseChatModel:
+        raise NotImplementedError
 
     async def generate(
         self,
@@ -88,15 +95,15 @@ class GeminiStructuredLLM:
         user_prompt: str,
         schema: type[T],
     ) -> LLMResult[T]:
-        llm_kwargs: dict[str, Any] = {
-            "model": model,
-            "temperature": temperature,
-            "google_api_key": self._settings.require_gemini_api_key(),
-        }
-        if self._client_max_retries is not None:
-            llm_kwargs["max_retries"] = self._client_max_retries
-        llm = ChatGoogleGenerativeAI(**llm_kwargs)
-        structured = llm.with_structured_output(schema, include_raw=True)
+        chat = self._chat_model(model=model, temperature=temperature)
+        if self.structured_method is None:
+            structured = chat.with_structured_output(schema, include_raw=True)
+        else:
+            structured = chat.with_structured_output(
+                schema,
+                method=self.structured_method,
+                include_raw=True,
+            )
         messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
         attempt = 0
         while True:
@@ -136,6 +143,83 @@ class GeminiStructuredLLM:
             msg = f"{schema.__name__} did not validate: {exc}"
             raise StructuredOutputError(msg) from exc
         return LLMResult(value=value, input_tokens=input_tokens, output_tokens=output_tokens)
+
+
+class GeminiStructuredLLM(_PacedStructuredLLM):
+    """Google Gemini structured output via langchain-google-genai."""
+
+    def _chat_model(self, *, model: str, temperature: float) -> BaseChatModel:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "temperature": temperature,
+            "google_api_key": self._settings.require_gemini_api_key(),
+        }
+        if self._client_max_retries is not None:
+            kwargs["max_retries"] = self._client_max_retries
+        return ChatGoogleGenerativeAI(**kwargs)
+
+
+class OpenRouterStructuredLLM(_PacedStructuredLLM):
+    """OpenRouter (OpenAI-compatible) structured output via langchain-openai.
+
+    Model IDs are OpenRouter slugs such as ``openai/gpt-oss-120b:free``. The JSON
+    schema response format is used; a model without structured-output support fails
+    with ``StructuredOutputError`` rather than silently returning prose.
+    """
+
+    structured_method = "json_schema"
+
+    def _chat_model(self, *, model: str, temperature: float) -> BaseChatModel:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "temperature": temperature,
+            "api_key": self._settings.require_openrouter_api_key(),
+            "base_url": self._settings.openrouter_base_url,
+            "default_headers": {"X-Title": "SentinelFlow"},
+        }
+        if self._client_max_retries is not None:
+            kwargs["max_retries"] = self._client_max_retries
+        return ChatOpenAI(**kwargs)
+
+
+def is_openrouter_model(model: str) -> bool:
+    """OpenRouter slugs are ``vendor/model``; Gemini model IDs have no slash."""
+    return "/" in model
+
+
+class RoutingStructuredLLM:
+    """Route each call to a provider by model ID (capability-based gateway).
+
+    Keeps the Triage Planner on a Gemini cheap tier while agents run elsewhere,
+    each provider behind its own pacer.
+    """
+
+    def __init__(self, *, gemini: StructuredLLM, openrouter: StructuredLLM | None) -> None:
+        self._gemini = gemini
+        self._openrouter = openrouter
+
+    async def generate(
+        self,
+        *,
+        model: str,
+        temperature: float,
+        system_prompt: str,
+        user_prompt: str,
+        schema: type[T],
+    ) -> LLMResult[T]:
+        target = self._gemini
+        if is_openrouter_model(model):
+            if self._openrouter is None:
+                msg = f"{model} looks like an OpenRouter model but OPENROUTER_API_KEY is unset"
+                raise RuntimeError(msg)
+            target = self._openrouter
+        return await target.generate(
+            model=model,
+            temperature=temperature,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema=schema,
+        )
 
 
 class StaticStructuredLLM:

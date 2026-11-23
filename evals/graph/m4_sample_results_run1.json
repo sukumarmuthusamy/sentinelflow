@@ -1,0 +1,233 @@
+{
+  "meta": {
+    "run_at_utc": "2026-11-23T01:05:13+00:00",
+    "agent_model": "nvidia/nemotron-3.5-super-vl:free",
+    "triage_model": "gemini-3.5-flash-lite",
+    "agent_temperature": 0.2,
+    "rpm": 5,
+    "stopped_reason": null
+  },
+  "results": [
+    {
+      "change_id": "CHG-H001",
+      "domain_pack_id": "healthcare-claims",
+      "status": "completed",
+      "decision": "PASS",
+      "expected_decision": "PASS",
+      "decision_matches_fixture": true,
+      "plan_agents": [
+        "change_analyst",
+        "evidence_investigator",
+        "evidence_verifier"
+      ],
+      "plan_category": "documentation",
+      "agent_status": {
+        "change_analyst": "ok",
+        "evidence_investigator": "ok"
+      },
+      "citations_in_final_state": 17,
+      "invalid_citations_after_filter": [],
+      "invented_ids_before_filter": [],
+      "material_assertions": 4,
+      "evidence_coverage": 0.75,
+      "llm_reported_evidence_coverage": 0.75,
+      "repair_count": 1,
+      "degraded_to_review": false,
+      "interrupt_paused_and_resumed": false,
+      "record_decision_written": false,
+      "trace_metrics": {
+        "agent_steps": 2,
+        "llm_calls": 6,
+        "mcp_tool_calls": 3,
+        "retrieval_queries": 6,
+        "input_tokens": 28601,
+        "output_tokens": 28394,
+        "estimated_cost_usd": 0.0,
+        "repair_count": 0,
+        "citations_rejected": 0
+      },
+      "errors": [],
+      "elapsed_seconds": 170.0
+    },
+    {
+      "change_id": "CHG-H003",
+      "domain_pack_id": "healthcare-claims",
+      "status": "completed",
+      "decision": "BLOCK",
+      "expected_decision": "BLOCK",
+      "decision_matches_fixture": true,
+      "plan_agents": [
+        "change_analyst",
+        "evidence_investigator",
+        "test_strategist",
+        "security_auditor",
+        "evidence_verifier"
+      ],
+      "plan_category": "auth_security",
+      "agent_status": {
+        "change_analyst": "ok",
+        "evidence_investigator": "ok",
+        "test_strategist": "ok",
+        "security_auditor": "ok"
+      },
+      "citations_in_final_state": 46,
+      "invalid_citations_after_filter": [],
+      "invented_ids_before_filter": [],
+      "material_assertions": 6,
+      "evidence_coverage": 1.0,
+      "llm_reported_evidence_coverage": 1.0,
+      "repair_count": 1,
+      "degraded_to_review": false,
+      "interrupt_paused_and_resumed": false,
+      "record_decision_written": false,
+      "trace_metrics": {
+        "agent_steps": 4,
+        "llm_calls": 8,
+        "mcp_tool_calls": 6,
+        "retrieval_queries": 8,
+        "input_tokens": 34605,
+        "output_tokens": 26227,
+        "estimated_cost_usd": 0.0,
+        "repair_count": 0,
+        "citations_rejected": 0
+      },
+      "errors": [],
+      "elapsed_seconds": 144.0
+    },
+    {
+      "change_id": "CHG-H002",
+      "domain_pack_id": "healthcare-claims",
+      "status": "completed",
+      "decision": "BLOCK",
+      "expected_decision": "BLOCK",
+      "decision_matches_fixture": true,
+      "plan_agents": [
+        "change_analyst",
+        "evidence_investigator",
+        "test_strategist",
+        "security_auditor",
+        "evidence_verifier"
+      ],
+      "plan_category": "api_contract",
+      "agent_status": {
+        "change_analyst": "ok",
+        "evidence_investigator": "ok",
+        "test_strategist": "ok",
+        "security_auditor": "ok"
+      },
+      "citations_in_final_state": 19,
+      "invalid_citations_after_filter": [],
+      "invented_ids_before_filter": [],
+      "material_assertions": 5,
+      "evidence_coverage": 0.4,
+      "llm_reported_evidence_coverage": 0.75,
+      "repair_count": 1,
+      "degraded_to_review": false,
+      "interrupt_paused_and_resumed": false,
+      "record_decision_written": false,
+      "trace_metrics": {
+        "agent_steps": 4,
+        "llm_calls": 8,
+        "mcp_tool_calls": 6,
+        "retrieval_queries": 9,
+        "input_tokens": 38049,
+        "output_tokens": 33758,
+        "estimated_cost_usd": 0.0,
+        "repair_count": 0,
+        "citations_rejected": 0
+      },
+      "errors": [],
+      "elapsed_seconds": 204.4
+    },
+    {
+      "change_id": "CHG-E001",
+      "domain_pack_id": "ecommerce-payments",
+      "status": "completed",
+      "decision": "PASS",
+      "expected_decision": "PASS",
+      "decision_matches_fixture": true,
+      "plan_agents": [
+        "change_analyst",
+        "evidence_investigator",
+        "test_strategist",
+        "security_auditor",
+        "evidence_verifier"
+      ],
+      "plan_category": "api_contract",
+      "agent_status": {
+        "change_analyst": "ok",
+        "evidence_investigator": "ok",
+        "test_strategist": "ok",
+        "security_auditor": "ok"
+      },
+      "citations_in_final_state": 27,
+      "invalid_citations_after_filter": [],
+      "invented_ids_before_filter": [],
+      "material_assertions": 5,
+      "evidence_coverage": 0.8,
+      "llm_reported_evidence_coverage": 0.92,
+      "repair_count": 0,
+      "degraded_to_review": false,
+      "interrupt_paused_and_resumed": false,
+      "record_decision_written": false,
+      "trace_metrics": {
+        "agent_steps": 4,
+        "llm_calls": 6,
+        "mcp_tool_calls": 6,
+        "retrieval_queries": 4,
+        "input_tokens": 15527,
+        "output_tokens": 30178,
+        "estimated_cost_usd": 0.0,
+        "repair_count": 0,
+        "citations_rejected": 0
+      },
+      "errors": [],
+      "elapsed_seconds": 193.9
+    },
+    {
+      "change_id": "CHG-E002",
+      "domain_pack_id": "ecommerce-payments",
+      "status": "completed",
+      "decision": "BLOCK",
+      "expected_decision": "BLOCK",
+      "decision_matches_fixture": true,
+      "plan_agents": [
+        "change_analyst",
+        "evidence_investigator",
+        "test_strategist",
+        "security_auditor",
+        "evidence_verifier"
+      ],
+      "plan_category": "api_contract",
+      "agent_status": {
+        "change_analyst": "ok",
+        "evidence_investigator": "ok",
+        "test_strategist": "ok",
+        "security_auditor": "ok"
+      },
+      "citations_in_final_state": 31,
+      "invalid_citations_after_filter": [],
+      "invented_ids_before_filter": [],
+      "material_assertions": 5,
+      "evidence_coverage": 1.0,
+      "llm_reported_evidence_coverage": 0.92,
+      "repair_count": 1,
+      "degraded_to_review": false,
+      "interrupt_paused_and_resumed": true,
+      "record_decision_written": true,
+      "trace_metrics": {
+        "agent_steps": 0,
+        "llm_calls": 0,
+        "mcp_tool_calls": 1,
+        "retrieval_queries": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost_usd": 0.0,
+        "repair_count": 0,
+        "citations_rejected": 0
+      },
+      "errors": [],
+      "elapsed_seconds": 348.5
+    }
+  ]
+}

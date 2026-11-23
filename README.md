@@ -10,7 +10,7 @@ SentinelFlow ingests a proposed software change and produces an **evidence-cited
 | **M1** | Complete | Deterministic signal layer: import graph, blast radius, oasdiff/buf, security scanners, risk engine, policy gate |
 | **M2** | Complete | `sentinelflow-context` MCP server (7 tools, 3 resources), typed client adapter |
 | **M3** | Complete | Hybrid RAG, pgvector + Qdrant adapters, Gemini embeddings, reranker ablation (none vs Voyage), eval harness |
-| **M4** | In progress | LangGraph workflow, five agents, triage planner, checkpoint + interrupt; live sample/sweep need `GEMINI_API_KEY` |
+| **M4** | In progress | LangGraph workflow, five agents, triage planner, checkpoint + interrupt; live sample passed on an OpenRouter stand-in model (100% citation validity, 10 trajectories) |
 
 Canonical architecture and roadmap: [SENTINELFLOW_PLAN.md](SENTINELFLOW_PLAN.md).  
 Real obstacles and tradeoffs from M0–M3: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
@@ -284,8 +284,9 @@ We evaluated local cross-encoder reranking and chose hosted Voyage for ablation 
 
 Callable from Python (no HTTP yet): `app/graph/` wires intake → deterministic signals → triage planner → parallel agents (`Send` + `defer=True` merge) → Evidence Verifier → optional repair (`Overwrite` on gaps) → risk engine → policy gate → report → `interrupt()` → `record_gate_decision`.
 
-- **Run sample scenarios:** `uv run python scripts/run_m4_sample.py` (requires `GEMINI_API_KEY`, pgvector for retrieval)
-- **Temperature sweep:** `uv run python scripts/temperature_sweep.py` (writes `evals/graph/temperature_sweep.json`)
+- **Run sample scenarios:** `uv run python -m scripts.run_m4_sample` (requires `GEMINI_API_KEY`, pgvector for retrieval). Add `--agent-model nvidia/nemotron-3.5-super-vl:free` with `OPENROUTER_API_KEY` set to run the agents on OpenRouter; any `vendor/model` ID routes there.
+- **Temperature sweep:** `uv run python -m scripts.temperature_sweep [--model <id>] [--out <path>]`
+- **Live results (2026-11-22, agents on `nvidia/nemotron-3.5-super-vl:free`, triage on `gemini-3.5-flash-lite`):** two full five-scenario runs, 10 trajectories, 0 invalid citations and 0 invented evidence IDs; 9/10 decisions match fixture labels; approval interrupt and resume verified live. Results in `evals/graph/m4_sample_results*.json`; analysis in [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md). `gemini-3.8-flash` not yet measured (free-tier daily cap).
 - **Tests:** `tests/graph/test_interrupt_resume.py` (static LLM + checkpoint resume)
 
 See [SENTINELFLOW_PLAN.md § M4](SENTINELFLOW_PLAN.md) for exit criteria.

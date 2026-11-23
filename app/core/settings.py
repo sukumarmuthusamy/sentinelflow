@@ -54,6 +54,11 @@ class Settings(BaseSettings):
         description="Local SQLite cache for embedding vectors (gitignored)",
     )
 
+    # OpenRouter (optional second generation provider, OpenAI-compatible)
+    openrouter_api_key: SecretStr | None = None
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_rpm: int = Field(default=20, ge=1, description="Free-model RPM limit")
+
     # Rerankers
     reranker_model: str = "Qwen/Qwen3-Reranker-0.6B"
     voyage_api_key: SecretStr | None = None
@@ -105,6 +110,14 @@ class Settings(BaseSettings):
             )
             raise RuntimeError(msg)
         return self.gemini_api_key.get_secret_value()
+
+    def require_openrouter_api_key(self) -> str:
+        """Return the OpenRouter API key or raise if missing."""
+        key = self.openrouter_api_key
+        if key is None or not key.get_secret_value().strip():
+            msg = "OPENROUTER_API_KEY is required for OpenRouter (vendor/model) IDs."
+            raise RuntimeError(msg)
+        return key.get_secret_value()
 
     def voyage_api_key_or_none(self) -> str | None:
         """Return Voyage API key when configured."""

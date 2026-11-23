@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 import uuid
@@ -24,7 +25,12 @@ from app.graph.runner import resume_analysis, run_analysis
 from app.graph.state import AnalysisRequest
 from app.mcp_client import SentinelFlowMcpAdapter
 from app.model_gateway.errors import is_daily_quota_exhausted
-from app.model_gateway.llm import GeminiStructuredLLM
+from app.model_gateway.llm import (
+    GeminiStructuredLLM,
+    OpenRouterStructuredLLM,
+    RoutingStructuredLLM,
+    StructuredLLM,
+)
 from app.model_gateway.pacing import AsyncMinIntervalPacer, min_interval_for_rpm
 from mcp_server.sentinelflow_context.server import mcp
 
@@ -80,7 +86,7 @@ def _expected_decision(request: AnalysisRequest) -> str | None:
     return str(expected.value) if expected is not None else None
 
 
-async def _run_one(row: dict[str, Any], *, llm: GeminiStructuredLLM) -> dict[str, Any]:
+async def _run_one(row: dict[str, Any], *, llm: StructuredLLM) -> dict[str, Any]:
     request = AnalysisRequest(
         change_id=str(row["change_id"]),
         domain_pack_id=str(row["domain_pack_id"]),
@@ -159,7 +165,12 @@ async def main() -> int:
         default=Path("evals/graph/sample_scenarios.jsonl"),
     )
     parser.add_argument("--only", action="append", help="change_id to run (repeatable)")
-    parser.add_argument("--rpm", type=int, default=5, help="generation requests per minute")
+    parser.add_argument("--rpm", type=int, default=5, help="Gemini requests per minute")
+    parser.add_argument(
+        "--agent-model",
+        help="override AGENT_LLM_MODEL; a vendor/model slug routes to OpenRouter",
+    )
+    parser.add_argument("--triage-model", help="override TRIAGE_LLM_MODEL")
     parser.add_argument(
         "--transient-retries",
         type=int,
@@ -169,13 +180,28 @@ async def main() -> int:
     parser.add_argument("--out", type=Path, default=Path("evals/graph/m4_sample_results.json"))
     args = parser.parse_args()
 
+    # The graph reads models from Settings; overrides go through the env + cache reset.
+    if args.agent_model:
+        os.environ["AGENT_LLM_MODEL"] = args.agent_model
+    if args.triage_model:
+        os.environ["TRIAGE_LLM_MODEL"] = args.triage_model
+    get_settings.cache_clear()
     settings = get_settings()
-    pacer = AsyncMinIntervalPacer(min_interval_for_rpm(args.rpm))
-    llm = GeminiStructuredLLM(
+
+    # One pacer per provider: each has its own RPM limit.
+    gemini = GeminiStructuredLLM(
         client_max_retries=0,
-        pacer=pacer,
+        pacer=AsyncMinIntervalPacer(min_interval_for_rpm(args.rpm)),
         transient_retries=args.transient_retries,
     )
+    openrouter = None
+    if settings.openrouter_api_key is not None:
+        openrouter = OpenRouterStructuredLLM(
+            client_max_retries=0,
+            pacer=AsyncMinIntervalPacer(min_interval_for_rpm(settings.openrouter_rpm)),
+            transient_retries=args.transient_retries,
+        )
+    llm = RoutingStructuredLLM(gemini=gemini, openrouter=openrouter)
     rows = _load_scenarios(args.scenarios)
     if args.only:
         rows = [row for row in rows if row["change_id"] in set(args.only)]
@@ -190,11 +216,25 @@ async def main() -> int:
             print(stopped_reason, file=sys.stderr)
             break
         results.append(result)
-        print(json.dumps({k: result.get(k) for k in (
-            "change_id", "status", "decision", "expected_decision",
-            "invalid_citations_after_filter", "invented_ids_before_filter",
-            "evidence_coverage", "degraded_to_review", "elapsed_seconds", "error",
-        )}))
+        print(
+            json.dumps(
+                {
+                    k: result.get(k)
+                    for k in (
+                        "change_id",
+                        "status",
+                        "decision",
+                        "expected_decision",
+                        "invalid_citations_after_filter",
+                        "invented_ids_before_filter",
+                        "evidence_coverage",
+                        "degraded_to_review",
+                        "elapsed_seconds",
+                        "error",
+                    )
+                }
+            )
+        )
 
     payload = {
         "meta": {

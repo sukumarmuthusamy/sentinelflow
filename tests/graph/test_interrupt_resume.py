@@ -59,5 +59,11 @@ async def test_interrupt_resume_record_gate_once(
             enable_retrieval=False,
         )
         assert resumed.get("record_decision_written") is True
+        # Resume rebuilds the context; trace counters must carry over, not reset.
+        before = paused["trace_metrics"]
+        after = resumed["trace_metrics"]
+        assert before["llm_calls"] > 0
+        assert after["llm_calls"] == before["llm_calls"]
+        assert after["mcp_tool_calls"] >= before["mcp_tool_calls"]
         lines = audit_log_path.read_text(encoding="utf-8").strip().splitlines()
         assert len(lines) == 1
