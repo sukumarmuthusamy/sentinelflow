@@ -32,7 +32,7 @@ from app.core.domain_pack import list_domain_pack_ids, load_domain_pack
 from app.core.errors import ErrorCode, SentinelFlowError
 from app.core.settings import Settings
 from app.deterministic.evaluate import resolve_fixture_directory
-from app.graph.state import AnalysisRequest
+from app.graph.state import AnalysisRequest, ApprovalStatus
 from app.jobs.evaluation import (
     EvaluationRunner,
     EvaluationSuite,
@@ -176,10 +176,23 @@ class JobService:
         """Subscribe to an analysis job's events, replaying durable ones after ``after_seq``.
 
         Read-only: opening, reading or abandoning a stream never starts, resumes or
-        cancels the job. Raises ``JOB_NOT_FOUND`` (also for an evaluation id) and
-        ``TOO_MANY_SUBSCRIBERS`` before any response is started.
+        cancels the job. Raises ``JOB_NOT_FOUND`` (also for an evaluation id),
+        ``INVALID_REQUEST`` for a cursor beyond the latest committed event, and
+        ``TOO_MANY_SUBSCRIBERS``, all before any response is started.
+
+        A cursor ahead of the job's history (an id from another job or another
+        database) would otherwise wait for events that may never be written. It is
+        refused before subscribing, so a refused request never holds a slot. Event
+        ids only grow, so a cursor valid now stays valid.
         """
         await self.get_job(job_id, kind=JobKind.ANALYSIS)
+        latest = await asyncio.to_thread(self._store.last_seq, job_id)
+        if after_seq > latest:
+            raise SentinelFlowError(
+                "Last-Event-ID is ahead of the latest event of this job",
+                code=ErrorCode.INVALID_REQUEST,
+                details={"field": "Last-Event-ID", "latest_event_id": latest},
+            )
         subscription = self._bus.subscribe(job_id)
         return JobEventStream(
             store=self._store,
@@ -512,6 +525,26 @@ class JobService:
                     job_error(ErrorCode.DECISION_INVARIANT_VIOLATED),
                 )
                 return
+        approval = result.approval
+        if (
+            not outcome.interrupted
+            and approval.required
+            and approval.status is ApprovalStatus.APPROVED
+            and not approval.gate_decision_recorded
+        ):
+            # An approved gate write must be confirmed (recorded, or an idempotent
+            # duplicate). The MCP server can answer "not recorded" without raising;
+            # that is a failed audit write, never a completed approval. The write is
+            # not retried (its outcome is ambiguous), and the stored pre-approval
+            # result keeps the decision readable.
+            logger.error("job %s: approved gate decision was not recorded", job.job_id)
+            await asyncio.to_thread(
+                self._fail_sync,
+                job.job_id,
+                JobStatus.RUNNING,
+                job_error(ErrorCode.GATE_DECISION_NOT_RECORDED),
+            )
+            return
         summary = {
             "decision": result.risk_assessment.decision.value,
             "degraded": result.degraded,

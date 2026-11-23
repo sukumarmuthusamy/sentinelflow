@@ -16,13 +16,14 @@ from app.agents.contracts import ChangeImpact
 from app.graph.runner import CheckpointSnapshot
 from app.graph.state import AnalysisPlan
 from app.jobs.events import JobEventType
+from app.jobs.streaming import JobEventStream
 from app.persistence.job_store import SqliteJobStore
 from pydantic import BaseModel, SecretStr
 
-from tests.api.conftest import FakeRuntime, Harness, HarnessFactory, api_settings
+from tests.api.conftest import BlockingLLM, FakeRuntime, Harness, HarnessFactory, api_settings
 from tests.api.sse_client import AsgiSseClient, SseEvent, durable, named
 from tests.graph.conftest import static_llm_responses
-from tests.graph.fakes import DEFAULT_CHUNKS
+from tests.graph.fakes import DEFAULT_CHUNKS, FailingToolMcp
 from tests.graph.streaming_fakes import FakeStreamingGatewayLLM, payloads_from
 
 PLAIN = {"change_id": "CHG-H001", "domain_pack_id": "healthcare-claims"}
@@ -712,3 +713,113 @@ async def test_subscriber_cap_is_enforced_before_streaming(
     assert refused.json()["error"]["code"] == "TOO_MANY_SUBSCRIBERS"
     assert refused.json()["error"]["details"]["max_subscribers"] == 1
     assert h.service.bus.subscriber_count(job_id) == 0
+
+
+# -- cursor policy and terminal handling (review M2) ------------------------------------
+
+
+async def test_future_cursor_on_an_active_job_is_refused(harness: HarnessFactory) -> None:
+    """Review M2: ``Last-Event-ID: 999`` on a running job used to hang forever."""
+    llm = BlockingLLM()
+    async with harness(runtime=FakeRuntime(llm)) as h:
+        job_id = await _create(h)
+        await asyncio.wait_for(llm.entered.wait(), 10)
+        last = h.service.store.last_seq(job_id)
+        async with _sse(h, job_id, **{"Last-Event-ID": "999"}) as sse:
+            status = sse.status
+            body = bytes(sse.body).decode("utf-8")
+        async with _sse(h, job_id, **{"Last-Event-ID": str(last + 1)}) as sse:
+            next_status = sse.status
+        assert h.service.bus.subscriber_count(job_id) == 0
+        llm.release()
+        await h.idle()
+    assert status == 422
+    assert '"code":"INVALID_REQUEST"' in body.replace(" ", "")
+    assert '"field":"Last-Event-ID"' in body.replace(" ", "")
+    assert next_status == 422  # even one past the latest committed event
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_cursor_at_latest_event_follows_to_the_terminal_event(
+    harness: HarnessFactory,
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    llm = BlockingLLM()
+    runtime = FakeRuntime(llm)
+    if outcome == "failed":
+        runtime = FakeRuntime(
+            llm,
+            wrap_mcp=lambda mcp: FailingToolMcp(mcp, failing_tool="get_change_package"),
+        )
+    async with harness(runtime=runtime) as h:
+        job_id = await _create(h)
+        await asyncio.wait_for(llm.entered.wait(), 10)
+        cursor = h.service.store.last_seq(job_id)  # read while events keep committing
+        async with _sse(h, job_id, **{"Last-Event-ID": str(cursor)}) as sse:
+            llm.release()
+            frames = await sse.events_until_end(timeout=20)
+        await h.idle()
+        stored = h.service.store.events(job_id)
+    assert [int(frame.id or 0) for frame in durable(frames)] == [
+        event.seq for event in stored if event.seq > cursor
+    ]
+    assert frames[-1].event in {"job.completed", "job.failed"}
+    assert h.service.bus.subscriber_count(job_id) == 0
+
+
+async def test_cursor_equal_to_the_terminal_event_closes_at_once(harness: HarnessFactory) -> None:
+    async with harness() as h:
+        job_id = (await h.run_to_rest(PLAIN))["job_id"]
+        last = h.service.store.last_seq(job_id)
+        async with _sse(h, job_id, **{"Last-Event-ID": str(last)}) as sse:
+            frames = await sse.events_until_end(timeout=5)
+    assert durable(frames) == []
+    assert h.service.bus.subscriber_count(job_id) == 0
+
+
+async def test_stream_ends_when_the_job_is_terminal_even_if_its_event_was_skipped(
+    harness: HarnessFactory,
+) -> None:
+    """Defence in depth below the route check: a cursor past the terminal event
+    (constructed directly) still ends the stream instead of holding the slot."""
+    llm = BlockingLLM()
+    async with harness(runtime=FakeRuntime(llm), api_sse_keepalive_seconds=0.1) as h:
+        job_id = await _create(h)
+        await asyncio.wait_for(llm.entered.wait(), 10)
+        stream = JobEventStream(
+            store=h.service.store,
+            subscription=h.service.bus.subscribe(job_id),
+            after_seq=999,
+            keepalive_seconds=0.1,
+            retry_ms=1000,
+        )
+
+        async def drain() -> list[bytes]:
+            return [frame async for frame in stream.frames()]
+
+        reader = asyncio.create_task(drain())
+        llm.release()
+        await h.idle()
+        frames = await asyncio.wait_for(reader, 10)
+        assert h.service.bus.subscriber_count(job_id) == 0
+    assert not any(frame.startswith(b"id:") for frame in frames)
+
+
+async def test_cursor_at_waiting_follows_approval_resume_to_completion(
+    harness: HarnessFactory,
+) -> None:
+    async with harness() as h:
+        job_id = (await h.run_to_rest(GATED))["job_id"]
+        cursor = h.service.store.last_seq(job_id)
+        async with _sse(h, job_id, **{"Last-Event-ID": str(cursor)}) as sse:
+            approved = await h.client.post(f"/v1/analyses/{job_id}/approval", json=APPROVE)
+            assert approved.status_code == 202
+            frames = await sse.events_until_end(timeout=20)
+    assert [frame.event for frame in durable(frames)][:3] == [
+        "job.approval_submitted",
+        "job.queued",
+        "job.running",
+    ]
+    assert frames[-1].event == "job.completed"
+    assert int(durable(frames)[0].id or 0) == cursor + 1

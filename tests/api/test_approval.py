@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from app.jobs.events import LIFECYCLE_EVENT_TYPES, JobEventType
 from app.model_gateway.llm import StaticStructuredLLM
+from mcp_server.sentinelflow_context.models import RecordGateDecisionResponse
 
 from tests.api.conftest import BlockingLLM, FakeRuntime, HarnessFactory, api_settings
 from tests.graph.conftest import static_llm_responses
@@ -260,3 +261,108 @@ async def test_gate_write_failure_fails_the_job_but_keeps_the_decision(
     assert decision.json()["result"]["approval"]["gate_decision_recorded"] is False
     assert h.audit_lines() == []
     assert again.status_code == 409
+
+
+class _GateOutcomeMcp:
+    """Wraps the real MCP client; ``record_gate_decision`` answers without raising.
+
+    ``recorded=False, duplicate=False`` is an unsuccessful write the server reported
+    instead of raising. ``duplicate=True`` is a valid idempotent outcome.
+    """
+
+    def __init__(self, inner: Any, *, recorded: bool, duplicate: bool) -> None:
+        self._inner = inner
+        self._recorded = recorded
+        self._duplicate = duplicate
+        self.gate_calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def call_tool_typed(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        response_model: type[Any],
+    ) -> Any:
+        if name != "record_gate_decision":
+            return await self._inner.call_tool_typed(name, arguments, response_model=response_model)
+        self.gate_calls += 1
+        args = arguments or {}
+        return RecordGateDecisionResponse(
+            recorded=self._recorded,
+            duplicate=self._duplicate,
+            analysis_id=args["analysis_id"],
+            decision=args["decision"],
+            idempotency_key=args["idempotency_key"],
+        )
+
+
+async def test_unconfirmed_gate_write_fails_the_job_and_keeps_the_decision(
+    harness: HarnessFactory,
+) -> None:
+    """Review M3: a non-raising unsuccessful audit write must never read as completed."""
+    wrappers: list[_GateOutcomeMcp] = []
+
+    def wrap(mcp: Any) -> _GateOutcomeMcp:
+        wrappers.append(_GateOutcomeMcp(mcp, recorded=False, duplicate=False))
+        return wrappers[-1]
+
+    async with harness(runtime=FakeRuntime(wrap_mcp=wrap)) as h:
+        job_id = (await h.run_to_rest(GATED))["job_id"]
+        before = (await h.client.get(f"/v1/analyses/{job_id}/decision")).json()
+        assert (await _approve(h, job_id)).status_code == 202
+        await h.idle()
+        status = (await h.client.get(f"/v1/analyses/{job_id}")).json()
+        after = (await h.client.get(f"/v1/analyses/{job_id}/decision")).json()
+        again = await _approve(h, job_id)
+        events = [event.type for event in h.service.store.events(job_id)]
+
+    assert status["status"] == "failed"
+    assert status["error"] == {
+        "code": "GATE_DECISION_NOT_RECORDED",
+        "message": status["error"]["message"],
+    }
+    assert "record_gate_decision" not in status["error"]["message"]
+    # The decision shown for approval stays readable, unchanged, and not recorded.
+    assert after["result"]["risk_assessment"] == before["result"]["risk_assessment"]
+    assert after["result"]["approval"]["gate_decision_recorded"] is False
+    assert JobEventType.JOB_COMPLETED not in events
+    assert events[-1] is JobEventType.JOB_FAILED
+    # One write attempt, never retried; no second approval can trigger another.
+    assert sum(wrapper.gate_calls for wrapper in wrappers) == 1
+    assert again.status_code == 409
+    assert h.audit_lines() == []
+
+
+async def test_idempotent_duplicate_gate_write_still_completes(harness: HarnessFactory) -> None:
+    runtime = FakeRuntime(wrap_mcp=lambda mcp: _GateOutcomeMcp(mcp, recorded=False, duplicate=True))
+    async with harness(runtime=runtime) as h:
+        job_id = (await h.run_to_rest(GATED))["job_id"]
+        assert (await _approve(h, job_id)).status_code == 202
+        await h.idle()
+        after = (await h.client.get(f"/v1/analyses/{job_id}/decision")).json()
+    assert after["status"] == "completed"
+    assert after["result"]["approval"]["gate_decision_recorded"] is True
+
+
+async def test_rejection_with_unconfirmed_gate_double_still_completes(
+    harness: HarnessFactory,
+) -> None:
+    """Rejection never calls the gate, so the M3 guard cannot fail it."""
+    wrappers: list[_GateOutcomeMcp] = []
+
+    def wrap(mcp: Any) -> _GateOutcomeMcp:
+        wrappers.append(_GateOutcomeMcp(mcp, recorded=False, duplicate=False))
+        return wrappers[-1]
+
+    async with harness(runtime=FakeRuntime(wrap_mcp=wrap)) as h:
+        job_id = (await h.run_to_rest(GATED))["job_id"]
+        await _approve(h, job_id, {"approved": False, "reviewer": "qa-lead"})
+        await h.idle()
+        after = (await h.client.get(f"/v1/analyses/{job_id}/decision")).json()
+    assert after["status"] == "completed"
+    assert after["result"]["approval"]["status"] == "rejected"
+    assert sum(wrapper.gate_calls for wrapper in wrappers) == 0
+    assert h.audit_lines() == []

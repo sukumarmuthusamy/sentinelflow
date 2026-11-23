@@ -454,3 +454,30 @@ Tests: `tests/api/test_errors_and_security.py` and `tests/api/test_approval.py`.
 - *Gap first.* Recovery emits `stream.gap` before the re-read durable events, which is also where the loss happened.
 
 Tests: `tests/api/test_events_stream.py`, `tests/graph/test_graph_streaming.py`, `tests/unit/test_stream_policy.py`.
+
+## M5 hardening: a fixed redaction window, a cursor from the future, a silent audit miss and usage read as zero
+
+**What looked wrong.** An independent backend review of M5-A/M5-B found four conditions, each reproduced offline before any fix:
+
+- a 241-character JWT fed in 7-character chunks left its first 113 characters in the stream, and a 146-character configured secret leaked its prefix;
+- `Last-Event-ID: 999` on a running job held the stream and its subscriber slot open forever;
+- an MCP double answering `record_gate_decision` with `recorded=false, duplicate=false` let an approved job end `completed`;
+- with no `usage_metadata`, six model calls settled as 0 tokens against a 1,000-token budget, and `input_tokens: "bad"` raised `ValueError` after the provider had answered.
+
+**Investigation.**
+
+- *Redaction.* The M5-B redactor held back the last 128 characters and released everything before them. Any credential longer than the window had a prefix outside it, which no pattern could yet match because the credential was incomplete. The configured-secret list also missed `POSTGRES_PASSWORD`, the password inside `DATABASE_URL` and `SENTINELFLOW_GITHUB_TOKEN`.
+- *Cursor.* Replay read events after the cursor, found none, then waited on the queue. Every new event had `seq <= cursor` and was skipped as "already sent", including `job.completed`, so the stream never saw the end. The keepalive safety net re-read events, also after the cursor.
+- *Gate write.* The graph node turns an unsuccessful write into a state error and does not set `record_decision_written`. The service settled any run that reached END as `completed`; it checked the decision invariant but not whether the approved write happened.
+- *Usage.* `_usage_tokens` returned `(0, 0)` for a missing report and called `int()` on whatever it found.
+
+**Root cause.** Each path trusted an assumption about its input: that a secret fits in a window, that a cursor names a committed event, that a non-raising MCP call succeeded, and that a provider always reports usage.
+
+**Decision.**
+
+- *Redaction without a window.* Text is emitted only once it cannot become part of a secret. The open token run is held until a delimiter closes it, the longest suffix that could start a configured secret is held, credential keywords and `//user:` are held until their value ends, and closed runs are classified whole (known shapes, longer than 200 characters, or machine-like). Raising the window would only move the boundary. Holding is bounded instead: past 1,024 characters (plus the longest configured secret) the held run becomes one `[REDACTED]` and the rest of it is discarded, which fails closed and caps memory. Tests feed synthetic JWTs, provider keys and configured secrets (including ones longer than the cap and ones with quotes) in 1-12-character random chunks and assert that no 8-character piece survives; the M5-B reassembly tests still pass byte for byte. Porting the original M5-B redaction cases to the new API caught one more gap: in `xxxBearer <token>` the keyword hold required a word boundary that the `Bearer` shape does not, so `Bearer ` was released before its token arrived. The holds now include an unanchored `bearer` and are re-applied until the cut stops moving, so streaming is never weaker than redacting the complete text. The cost: harmless machine-like identifiers are redacted, and a short word-like secret of unknown format is still not recognised.
+- *Cursor policy.* A cursor above the job's latest committed `seq` is refused with `422 INVALID_REQUEST` (`field`, `latest_event_id`) before subscribing, so no slot is taken. A skipped terminal event and a terminal job seen at a keepalive both end the stream. A 422 was preferred over silently restarting from 0: the client's cursor is wrong, and replaying a different history under it would hide that.
+- *Confirmed gate writes.* An approved, recording job completes only if the write was recorded or is an idempotent duplicate; otherwise it fails with `GATE_DECISION_NOT_RECORDED`, keeps its pre-approval result, and the write is not retried.
+- *Unknown usage is estimated, never zero.* Missing, malformed, negative, fractional and zero counts are replaced by characters divided by 3, which over-counts. Accounting never raises, so an answered call is not retried. The six-call reproduction now stops at the budget and degrades to review.
+
+Tests: `tests/unit/test_stream_redaction.py`, `tests/unit/test_usage_accounting.py`, new cases in `tests/api/test_events_stream.py` and `tests/api/test_approval.py`.

@@ -53,6 +53,11 @@ class FakeStreamingChatModel(BaseChatModel):
     # tests can show token accounting survives the streaming path.
     input_tokens: int = 11
     output_tokens: int = 7
+    # False: report no usage at all (a provider that omits it from streams).
+    report_usage: bool = True
+    # Set as-is on the finished (non-streamed) message, bypassing validation, to
+    # model a provider returning malformed usage after billing the call.
+    raw_usage_override: Any = None
     # Optional gate: after ``pause_after`` fragments of a response for ``pause_schema``
     # the stream sets ``paused`` and waits for ``resume`` (proves fragments leave
     # before the model has finished).
@@ -120,9 +125,13 @@ class FakeStreamingChatModel(BaseChatModel):
             )
         else:
             message = AIMessage(content=payload, usage_metadata=usage)
+        if self.raw_usage_override is not None:
+            message.usage_metadata = self.raw_usage_override
         return ChatResult(generations=[ChatGeneration(message=message)])
 
     def _usage(self) -> Any:
+        if not self.report_usage:
+            return None
         return {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,

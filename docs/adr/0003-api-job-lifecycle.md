@@ -57,6 +57,7 @@ The table in `app/jobs/models.py` is closed. Terminal states have no exits, and 
 - Each job runs as an asyncio task in the process that accepted it, behind a semaphore of `API_MAX_CONCURRENT_RUNS`, which defaults to 1 because of free-tier pacing.
 - Immediately before running, a job is acquired by a `queued → running` compare-and-set. Two launchers can never both run one job, for example the accepting process and a restart's recovery.
 - The default runtime shares one gateway, with per-provider pacers and no SDK retries, across all jobs in the process.
+- **Token accounting.** The per-analysis token budgets are charged from each call's reported usage. A report that is missing, malformed, negative, fractional or zero is treated as unknown, never as zero: that count is replaced by a conservative estimate (prompt or response characters divided by 3, at least 1), and a warning without values is logged. Accounting never raises, so a call the provider has already answered and billed is never failed or retried because of its usage report. Valid reports are used as reported.
 
 ### Approval
 
@@ -65,6 +66,7 @@ The table in `app/jobs/models.py` is closed. Terminal states have no exits, and 
 - The resume calls `resume_analysis` on the job's original `thread_id` with only `{"approved": bool}`. Reviewer identity never enters graph state. The runner restores budgets and trace counters (M4).
 - The gate idempotency key is `"<job_id>-gate"`, so the MCP audit log deduplicates even a manual re-resume.
 - After the resume, the service checks that the decision and risk score equal the pre-approval result, and fails the job with `DECISION_INVARIANT_VIOLATED` otherwise. Approval gates the write; it can never change the decision.
+- An approved job completes only if the gate write is **confirmed**: `recorded`, or a `duplicate` of the same idempotency key. The MCP server can answer `recorded=false, duplicate=false` without raising; the job then fails with `GATE_DECISION_NOT_RECORDED`, keeps its stored pre-approval result (decision and risk score unchanged, `gate_decision_recorded: false`), and the write is not retried, because its outcome is ambiguous. A rejection never writes, so it cannot fail this way.
 
 ### Recovery (on startup, one process per database)
 
@@ -116,10 +118,12 @@ Node inputs, errors and interrupt payloads are dropped in translation, so nothin
 - **Durable events** share the job's gap-free `seq` with lifecycle events. They are written only while the job is `running` (`append_events` checks the status in the same transaction), so nothing can follow a run's `job.failed`. The SSE `id:` is `seq`.
 - **Live events have no `id:` line**, so they never move the browser's `Last-Event-ID`, and there are no live ids to collide or leave gaps. Instead each carries `after_seq`, the durable event it follows, and `(run, index)`, which is gap-free per run as emitted.
 - **Connecting:** subscribe first, then replay the store's durable events after `Last-Event-ID` (an integer, else `422`).
+  - A cursor **ahead** of the job's latest committed event gets `422 INVALID_REQUEST` with `details: {field: "Last-Event-ID", latest_event_id}` before any stream starts or subscription is taken. Such an id belongs to another job or database; following it would wait for events that may never be written. Event ids only grow, so a cursor valid when checked stays valid.
   - Durable events at or below the last `seq` sent are skipped.
   - A jump in `seq` is filled from the store.
   - A live event whose `after_seq` is older than a durable event already sent is not delivered, so a fragment never appears after its node's `node.completed`.
 - **End of stream:** the stream ends after `job.completed` or `job.failed`, and immediately for a terminal job whose terminal event the client already has. It stays open through `waiting_for_approval`.
+  - A stream never outlives its job: a terminal event arriving at or below the cursor still ends it, and each keepalive re-reads the job and ends the stream if it is terminal. Every end releases the subscription.
 - **Keepalive:** a `: keepalive` comment every `API_SSE_KEEPALIVE_SECONDS`. Each one also re-reads the store as a safety net. There is no busy-waiting: the stream blocks on its queue with a timeout.
 - **Fan-out:** the store calls a listener after each commit. The bus publishes through `call_soon_threadsafe`, which is queued before the store call's own result, so a writer's events are published before it resumes.
 
@@ -142,7 +146,15 @@ Node inputs, errors and interrupt payloads are dropped in translation, so nothin
   - credential shapes are redacted: Google, OpenAI/OpenRouter, GitHub, Slack, AWS key ids, Bearer tokens, JWTs and private-key blocks;
   - the exact values of configured secrets are redacted.
 
-  Redaction runs over a 128-character held-back window per response, so a credential split across chunks is still caught; a private-key block is held until its END line. Fragments are therefore re-chunked: up to 128 characters later than the provider sent them, and at most `API_STREAM_FRAGMENT_MAX_CHARS` each.
+  Configured secrets are the provider and service keys, `API_KEY`, `POSTGRES_PASSWORD`, the password inside `DATABASE_URL` and `SENTINELFLOW_GITHUB_TOKEN`; values shorter than 8 characters and the public development default are not matched, and no value is logged.
+
+  Redaction is **streaming-aware and fail-closed** (`app/jobs/redaction.py`), with one state per response. It does not use a fixed window: it emits text only once it can no longer become part of a secret.
+  - The open token run at the end of the buffer (letters, digits, `_-+/=.~%`) is held until a delimiter closes it. A closed run is redacted if it matches a known shape, is longer than 200 characters, or looks machine-generated (32+ characters of mixed-case alphanumerics with digits, or long hex).
+  - The longest buffer suffix that is a prefix of a configured secret (raw or JSON-escaped) is held, so a configured value is never emitted in part, even one containing spaces or quotes.
+  - Credential keywords (`password`, `api_key`, `bearer`, ...) are held with their separator until their value is complete; `//user:` is held until the URL authority ends; a private-key block is held until its END line.
+  - **Bounded:** a held run longer than 1,024 characters (plus the longest configured secret) or an open block longer than 8,192 is replaced by one `[REDACTED]`, and the rest of it is discarded as it arrives instead of being released. An unterminated block at the end of a response is never shown.
+
+  Safe text still streams incrementally. Fragments are re-chunked: delayed until the run they end in closes, and at most `API_STREAM_FRAGMENT_MAX_CHARS` each.
 - **Bounded:** at most `API_STREAM_MAX_FRAGMENTS_PER_RUN` per run. Further fragments are counted in `fragments_dropped`.
 - **Opt-in:** off unless `API_STREAM_TOKENS=true`. `messages` mode attaches a streaming callback handler, and LangChain then calls the provider's *streaming* API (`BaseChatModel._should_stream`). That changes the HTTP call live providers receive.
   - `langchain-openai` omits usage from streams when `base_url` is custom, which would zero OpenRouter token budgets. The OpenRouter client therefore sets `stream_usage=True`, which affects only streamed calls.
@@ -152,7 +164,7 @@ Node inputs, errors and interrupt payloads are dropped in translation, so nothin
 
 - Token events cannot be replayed: a client that connects late sees the remaining fragments only.
 - The live fan-out is per process, so an SSE client must reach the process running the job (one worker, as before).
-- Redaction is pattern-based. It cannot recognise a credential with an unknown shape, only configured values and known formats.
+- Redaction is shape-based. Beyond configured values and known formats it redacts long or machine-like runs, but a short credential with an unknown, word-like format is not recognised. Machine-like identifiers (long hashes, long mixed-case ids) are redacted even when harmless.
 
 ## Consequences
 
@@ -170,7 +182,8 @@ Node inputs, errors and interrupt payloads are dropped in translation, so nothin
   - LLM calls already made in that run are spent;
   - provider calls inside a run are not deduplicated.
 - **Single process per job database.** The atomic create and transition hold across processes, but recovery, the run semaphore and the live event fan-out do not. `serve` enforces one worker. Running several workers against one database is unsupported.
-- **No cancel or retry endpoint.** A gated job whose audit write failed (`MCP_ERROR` after approval) keeps its decision but cannot be re-approved in M5-A.
+- **No cancel or retry endpoint.** A gated job whose audit write failed (`MCP_ERROR` or `GATE_DECISION_NOT_RECORDED` after approval) keeps its decision but cannot be re-approved in M5.
+- **Estimated usage over-counts.** When a provider omits usage, the estimate is deliberately high, so the budget can stop an analysis earlier than its real token use would.
 - **The deterministic evaluation suite only checks consistency.** Its fixtures are labelled with the decisions the M1 integration test already enforces, so its 100% decision accuracy is by construction, not a measurement. The graph and retrieval suites need live providers and stay as M4 and M3 scripts until M6.
 
 ### Neutral

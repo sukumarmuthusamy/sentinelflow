@@ -196,6 +196,10 @@ _FAILURE_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.GRAPH_INCOMPLETE: (
         "The run ended without reaching the end of the graph or an approval interrupt."
     ),
+    ErrorCode.GATE_DECISION_NOT_RECORDED: (
+        "The approved gate decision was not confirmed as recorded in the audit log. "
+        "The decision is unchanged; the write was not retried."
+    ),
 }
 
 

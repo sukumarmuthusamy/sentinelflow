@@ -29,8 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
-import unicodedata
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 
@@ -47,6 +45,12 @@ from app.jobs.events import (
     StreamGapData,
 )
 from app.jobs.models import TERMINAL_STATUSES
+from app.jobs.redaction import (
+    FragmentRedactor,
+    StreamRedactor,
+    configured_secret_values,
+    strip_controls,
+)
 from app.persistence.job_store import SqliteJobStore, utc_now
 
 logger = logging.getLogger(__name__)
@@ -162,69 +166,6 @@ class JobEventBus:
             self.publish(event)
 
 
-# -- fragment policy ---------------------------------------------------------------
-
-REDACTED = "[REDACTED]"
-
-# Credential shapes redacted from every fragment. Matching runs over a held-back
-# window (``_HOLDBACK``), so a credential split across chunks is still caught.
-_CREDENTIAL_PATTERNS: tuple[str, ...] = (
-    r"AIza[0-9A-Za-z_\-]{30,}",  # Google API key
-    r"sk-[A-Za-z0-9_\-]{16,}",  # OpenAI / OpenRouter style
-    r"gh[pousr]_[A-Za-z0-9]{20,}",  # GitHub tokens
-    r"github_pat_[A-Za-z0-9_]{20,}",
-    r"xox[abposr]-[A-Za-z0-9\-]{10,}",  # Slack
-    r"AKIA[0-9A-Z]{16}",  # AWS access key id
-    r"(?i:bearer)\s+[A-Za-z0-9._~+/\-]{16,}=*",
-    r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}",  # JWT
-    # A private key block, held until its END line (or the response ends).
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
-)
-_HOLDBACK = 128
-_MIN_SECRET_CHARS = 8
-
-
-def configured_secret_values(settings: Settings) -> list[str]:
-    """Exact secret values this process holds, redacted wherever they appear."""
-    values: list[str] = []
-    for name in ("gemini_api_key", "openrouter_api_key", "voyage_api_key", "qdrant_api_key"):
-        secret = getattr(settings, name, None)
-        if secret is not None:
-            values.append(secret.get_secret_value())
-    if settings.api_key is not None:
-        values.append(settings.api_key.get_secret_value())
-    return [value for value in values if len(value.strip()) >= _MIN_SECRET_CHARS]
-
-
-class FragmentRedactor:
-    """Splits a growing text into a redacted, safe-to-emit prefix and a held tail."""
-
-    def __init__(self, secret_values: Sequence[str] = ()) -> None:
-        exact = [re.escape(value) for value in secret_values]
-        # Exact values first, so a configured key is redacted whole.
-        alternatives = [*exact, *_CREDENTIAL_PATTERNS]
-        self._pattern = re.compile("|".join(f"(?:{item})" for item in alternatives))
-
-    def split(self, text: str, *, final: bool) -> tuple[str, str]:
-        if final:
-            return self._pattern.sub(REDACTED, text), ""
-        cut = max(0, len(text) - _HOLDBACK)
-        for match in self._pattern.finditer(text):
-            if match.end() >= len(text):
-                # May still be growing: hold it back whole.
-                cut = min(cut, match.start())
-            elif match.start() < cut < match.end():
-                cut = match.end()  # complete match straddling the cut: emit it redacted
-        return self._pattern.sub(REDACTED, text[:cut]), text[cut:]
-
-
-def strip_controls(text: str) -> str:
-    """Drop control and format characters (bidi overrides, zero-width) but keep whitespace."""
-    return "".join(
-        char for char in text if char in "\n\r\t" or not unicodedata.category(char).startswith("C")
-    )
-
-
 @dataclass
 class _ResponseBuffer:
     task_id: str
@@ -233,7 +174,7 @@ class _ResponseBuffer:
     schema: str
     channel: str
     response: int
-    pending: str = ""
+    redactor: StreamRedactor
 
 
 @dataclass
@@ -266,7 +207,7 @@ class GraphEventSink:
         self._last_seq = last_seq
         self._max_chars = settings.api_stream_fragment_max_chars
         self._max_fragments = settings.api_stream_max_fragments_per_run
-        self._redactor = FragmentRedactor(configured_secret_values(settings))
+        self._redaction = FragmentRedactor(configured_secret_values(settings))
         self._index = 0
         self._tasks: dict[str, _TaskCounters] = {}
         self._buffers: dict[tuple[str, str, str], _ResponseBuffer] = {}
@@ -350,16 +291,16 @@ class GraphEventSink:
                 schema=fragment.schema,
                 channel=fragment.channel,
                 response=response,
+                redactor=self._redaction.stream(),
             )
             self._buffers[key] = buffer
-        buffer.pending += strip_controls(fragment.text)
-        safe, buffer.pending = self._redactor.split(buffer.pending, final=False)
+        safe = buffer.redactor.feed(strip_controls(fragment.text))
         self._emit(buffer, safe, counters)
 
     def _flush(self, task_id: str) -> None:
         for key in [key for key in self._buffers if key[0] == task_id]:
             buffer = self._buffers.pop(key)
-            safe, _ = self._redactor.split(buffer.pending, final=True)
+            safe = buffer.redactor.finish()
             self._emit(buffer, safe, self._tasks.setdefault(task_id, _TaskCounters()))
 
     def _emit(self, buffer: _ResponseBuffer, text: str, counters: _TaskCounters) -> None:
@@ -452,6 +393,12 @@ class JobEventStream:
                     # Cheap safety net for anything a dropped publish may have missed.
                     async for frame in self._backfill():
                         yield frame
+                    if not self._done:
+                        # Never outlive the job: a terminal job has no more events to
+                        # wait for, even if its terminal event was not sent here.
+                        job = await asyncio.to_thread(self._store.get, self._job_id)
+                        if job is None or job.status in TERMINAL_STATUSES:
+                            self._done = True
                     continue
                 async for frame in self._deliver(item):
                     yield frame
@@ -461,6 +408,8 @@ class JobEventStream:
     async def _deliver(self, item: StreamItem) -> AsyncIterator[bytes]:
         if isinstance(item, JobEvent):
             if item.seq <= self._last:
+                if item.type in TERMINAL_EVENT_TYPES:
+                    self._done = True  # the job is over even if this id was skipped
                 return  # already sent (replay overlap)
             if item.seq > self._last + 1:
                 async for frame in self._backfill():  # fills the gap, includes item
