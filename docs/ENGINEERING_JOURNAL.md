@@ -358,3 +358,34 @@ Seed PR 7 and seed PR 10 both reached PASS, while their fixtures (CHG-H002 and C
 A pre-existing labeling issue also surfaced. `dependency_vuln_at_or_above_ceiling` checks the overall `security.max_severity`. As a result, CHG-H003's critical secret is reported as `dependency-vuln-ceiling` rather than `secret-exposure`. The decision is the same, but the label is misleading. This is left for M6.
 
 Evidence: `evals/github/m2_live_smoke_tools.json`.
+
+## M2 hardening: five fail-open paths in the GitHub source, and a sixth in gitleaks' own config loading
+
+**What looked wrong.** An independent review of `e1da9d0..a19f81f` found five medium-severity gaps, and each one reproduced locally:
+
+- **Renames.** A rename that moved `contracts/svc-core-api.yaml` out of its declared path resolved to `svc-analytics`, with contract diff `not_applicable` and no gaps. The result was PASS.
+- **Scanner output.** Truncated or unexpected oasdiff JSON, and a gitleaks report that was not a list, both parsed as clean.
+- **Docker.** The images were tag-referenced (oasdiff at `latest`), and the containers ran without resource or privilege limits.
+- **Forks.** For a fork PR, head contents were requested from `head.repo.full_name`, with the token attached.
+- **Timeouts.** `subprocess.TimeoutExpired` escaped the scanner wrappers, and the container kept running.
+
+**Investigation.**
+
+- *Renames.* Normalization ignored `previous_filename` for service ownership and contract detection. An unsafe previous path was dropped silently, and the base version was then read from the new path.
+- *Parsing.* Both parsers treated "not recognised" as "no findings". oasdiff output fell back to a line regex that never matches oasdiff's real text format.
+- *Forks.* A probe against a public fork PR showed that the base repository's Contents API serves the fork's head SHA (200, also via `refs/pull/<n>/head`). An unknown SHA returns 404. So reading from the fork was never needed.
+- *Timeouts.* The first fix removed the container by name after a timeout. A forced timeout against the real image left a container in the `Created` state: the CLI was killed between create and start, so `rm -f` ran before the container existed. Creating the container synchronously with `docker create`, starting it with `docker start --attach`, and always removing it afterwards closed the race. Four repeated forced timeouts left nothing.
+- *gitleaks configuration (found while verifying the fix).* gitleaks v8.30.1 reads `.gitleaks.toml` and `.gitleaksignore` from the scan target and honours inline `gitleaks:allow`. A PR controls all three. Planting each one suppressed a real detection.
+- *M1 `run_oasdiff`.* It mounted only the base spec's directory, and both fixtures keep base and revision in sibling directories under the same file name. So it diffed the base against itself and reported a clean result. This only affects `fixture_only=False`, which no default caller uses.
+
+**Root cause.** The live path inherited M1's habit of turning anything it could not interpret into an empty result. The pull request metadata (head repository, previous path) was trusted more than the configuration.
+
+**Decision.**
+
+- *Parsing.* Both parsers are strict. Every scanner failure mode raises `ScannerError` with a fixed reason. That error becomes a gap (REVIEW), and it never weakens a deterministic BLOCK.
+- *Repository boundary.* Every request targets the configured repository, and `GitHubApi` enforces this.
+- *Renames.* Renamed files count at both paths.
+- *Docker.* Images are pinned to their registry OCI index digests, which were verified with `docker buildx imagetools inspect`. A gitleaks binary on PATH is used only at exactly 8.30.1. Containers run under `app/deterministic/docker_sandbox.py`.
+- *gitleaks configuration.* gitleaks gets an explicit default config and a trusted ignore path, PR files are staged one level below the target, and inline allow comments are ignored. Its default rule allowlists, such as the one for AWS `EXAMPLE` keys, are unchanged.
+
+Tests: `tests/contract/test_github_hardening.py`, `tests/unit/test_github_signal_tools.py`, and the scanner-failure and rename cases in `tests/graph/test_github_change_source.py`.

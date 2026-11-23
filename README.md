@@ -130,15 +130,16 @@ Optional for local development. CI and `fixture_only=True` use committed signals
 
 | Tool | Purpose | Install |
 |---|---|---|
-| **oasdiff** | OpenAPI breaking-change detection | **Docker (recommended):** `docker pull tufin/oasdiff` — invoked as `docker run --rm tufin/oasdiff breaking ...` |
+| **oasdiff** | OpenAPI breaking-change detection | **Docker:** `docker pull tufin/oasdiff@sha256:e6afae33552b0c2cbd1d00883cdbf03b8b9b05ebb4d2f8d8cb8392ddb48837d5` (build `059301e`, pinned by digest; never pulled implicitly) |
 | **buf** | Protobuf breaking-change detection | [github.com/bufbuild/buf](https://github.com/bufbuild/buf) — `brew install bufbuild/buf/buf` or release binary. Stubbed with TODO until domain packs ship `.proto` assets. |
-| **gitleaks** | Secret detection | [github.com/gitleaks/gitleaks](https://github.com/gitleaks/gitleaks) — `brew install gitleaks` or GitHub release |
+| **gitleaks** | Secret detection | GitHub mode: `docker pull zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f` (or a gitleaks 8.30.1 binary on PATH). M1 fixture scans: [github.com/gitleaks/gitleaks](https://github.com/gitleaks/gitleaks) |
 | **semgrep** | Static analysis (CE rules) | [github.com/semgrep/semgrep](https://github.com/semgrep/semgrep) — `pip install semgrep` or `brew install semgrep` |
 | **osv-scanner** | Dependency vulnerability scan | [google/osv-scanner](https://google.github.io/osv-scanner/) — `go install github.com/google/osv-scanner/cmd/osv-scanner@latest` or GitHub release |
 
 **Container vs local:**
 
-- **oasdiff** — always runs via the `tufin/oasdiff` Docker image when Docker is available; there is no PyPI package.
+- **oasdiff** — runs only from the digest-pinned `tufin/oasdiff` image, in a locked-down container (`app/deterministic/docker_sandbox.py`); there is no PyPI package. Any failure or unparseable output is `tool=unavailable`, never a clean diff.
+- **Scanner containers** run with `--pull=never --network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=64 --memory=512m --cpus=1`, as an unprivileged user, with read-only inputs. Each gets a unique `sf-scan-<uuid>` name and is force-removed by that name after every run, including timeouts and cancellations.
 - **gitleaks, semgrep, osv-scanner** — subprocess wrappers expect binaries on `PATH`.
 - **buf** — subprocess when installed; otherwise returns `tool=unavailable` and fixtures supply offline signals.
 
@@ -214,8 +215,10 @@ Business/validation failures surface as `ToolError` (`is_error=True` on the wire
 - **Configuration.** The repository and the path-to-service rules come from `domains/<pack>/live_source.yaml`, never from tool input. Both packs point at the synthetic seed repo `sukumarmuthusamy/sentinelflow-demo-platform`.
 - **Access.** GET requests to the GitHub REST API only. `SENTINELFLOW_GITHUB_TOKEN` is optional; for private repos use a fine-grained token with read-only *Pull requests* and *Contents* access. The token is never logged or echoed in errors.
 - **Normalization.** Same `ChangePackageResponse` as fixtures. A code file originates at its owning service and a non-code file at the file itself, as in the fixtures. The PR title is sanitized and kept out of agent input; the body is not stored.
-- **Signals.** oasdiff runs on the base and head versions of each changed contract, and gitleaks runs on the head version of each changed file. Both run from PATH or a local Docker image (`--pull=never`, no network). The test inventory is empty and semgrep is not run; both are reported as notes.
-- **Incomplete data degrades.** A missing tool, an unreadable or oversized file, a truncated file list, an unattributed code file or a changed dependency manifest is recorded in `gaps`. The run then degrades to REVIEW before any LLM call (`override_applied = incomplete_change_data`) and never weakens a deterministic BLOCK. A missing PR, bad credentials, a rate limit or an API outage stops the run with the reason.
+- **Signals.** oasdiff runs on the base and head versions of each changed contract (for a renamed or copied contract, the base is its original path). gitleaks runs on the head version of each changed file. Both run from digest-pinned local images in locked-down containers. gitleaks gets an explicit default configuration, so a `.gitleaks.toml`, a `.gitleaksignore` or an inline `gitleaks:allow` in the pull request cannot hide a finding. The default rule allowlists are unchanged. The test inventory is empty and semgrep is not run; both are reported as notes.
+- **Repository boundary.** Every request goes to the configured repository, including for a pull request from a fork: the head commit is read through the base repository at its SHA, and the client refuses any other repository, so a token never reaches a fork. If GitHub does not serve the fork's head commit there, the reads become gaps.
+- **Renames.** A renamed file counts at both paths, so moving code out of a service still impacts that service. An unsafe or missing previous path, or a contract moved away from its declared path, is a gap.
+- **Incomplete data degrades.** A missing tool, a scanner that times out, fails or returns invalid output, an unreadable or oversized file, a truncated file list, an unattributed code file or a changed dependency manifest is recorded in `gaps`. The run then degrades to REVIEW before any LLM call (`override_applied = incomplete_change_data`) and never weakens a deterministic BLOCK. A missing PR, bad credentials, a rate limit or an API outage stops the run with the reason.
 - **Live check:** `uv run python scripts/github_smoke.py --output <file>` compares fixture/PR pairs deterministically (no LLM calls). Two runs from 2026-11-23 are recorded:
   - `evals/github/m2_live_smoke.json`, without scanners. Every PR ended at REVIEW, because the missing oasdiff and gitleaks are recorded as gaps instead of being read as clean scans.
   - `evals/github/m2_live_smoke_tools.json`, with `tufin/oasdiff` and `zricethezav/gitleaks:v8.30.1`. There were no gaps, and two pairs matched their fixtures:

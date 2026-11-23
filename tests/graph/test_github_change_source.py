@@ -28,7 +28,12 @@ from app.mcp_client.source_binding import (
 from app.model_gateway.llm import StaticStructuredLLM
 from pydantic import BaseModel
 from tests.contract.conftest import mcp_session
-from tests.contract.github_fakes import SCRIPTED_OASDIFF_ERR, FakeSignalTools, github_offline
+from tests.contract.github_fakes import (
+    SCRIPTED_OASDIFF_ERR,
+    FakeGitHub,
+    FakeSignalTools,
+    github_offline,
+)
 from tests.graph.conftest import RunGraph, static_llm_responses
 
 DOMAINS_ROOT = Path(__file__).resolve().parents[2] / "domains"
@@ -151,6 +156,46 @@ async def test_incomplete_data_never_weakens_a_deterministic_block(run_graph: Ru
         result = await run_graph("PR-7", llm, source="github")
     assert result["degraded_to_review"] is True
     assert result["risk_assessment"]["decision"] == "BLOCK"
+
+
+async def test_scanner_timeout_degrades_before_any_llm_call(run_graph: RunGraph) -> None:
+    tools = FakeSignalTools()
+    tools.scanner_error = "gitleaks timed out"
+    llm = StaticStructuredLLM(static_llm_responses())
+    with github_offline(tools=tools):
+        result = await run_graph("PR-1", llm, source="github")
+    assert result["risk_assessment"]["decision"] == "REVIEW"
+    assert result["risk_assessment"]["override_applied"] == "incomplete_change_data"
+    assert any("gitleaks timed out" in error for error in result["errors"])
+    assert llm.prompts == []
+
+
+async def test_scanner_failure_keeps_a_deterministic_block(run_graph: RunGraph) -> None:
+    tools = FakeSignalTools(contract=parse_oasdiff_output(SCRIPTED_OASDIFF_ERR))
+    tools.scanner_error = "gitleaks returned no valid report"
+    llm = StaticStructuredLLM(static_llm_responses())
+    with github_offline(tools=tools):
+        result = await run_graph("PR-7", llm, source="github")
+    assert result["degraded_to_review"] is True
+    assert result["risk_assessment"]["decision"] == "BLOCK"
+
+
+async def test_contract_renamed_away_cannot_pass(run_graph: RunGraph) -> None:
+    fake = FakeGitHub.recorded()
+    fake.clone_pull(7, 80)
+    fake.files[80] = [
+        {"filename": "analytics_docs/old-contract.yaml", "status": "renamed",
+         "previous_filename": "contracts/svc-core-api.yaml", "changes": 0},
+    ]  # fmt: skip
+    fake.pulls[80]["changed_files"] = 1
+    head = fake.pulls[80]["head"]["sha"]
+    fake.contents[f"{head}:analytics_docs/old-contract.yaml"] = b"openapi: 3.1.0\n"
+    llm = StaticStructuredLLM(static_llm_responses())
+    with github_offline(fake, FakeSignalTools()):
+        result = await run_graph("PR-80", llm, source="github")
+    assert result["risk_assessment"]["decision"] == "REVIEW"
+    assert any("was renamed" in error for error in result["errors"])
+    assert llm.prompts == []
 
 
 async def test_missing_pr_stops_the_run_without_retrying(run_graph: RunGraph) -> None:

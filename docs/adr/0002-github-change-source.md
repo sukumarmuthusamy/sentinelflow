@@ -18,6 +18,12 @@ The deterministic layer runs inside `sentinelflow-context`. oasdiff needs the ba
 - A token is optional: public repositories are readable without one. When one is set (`SENTINELFLOW_GITHUB_TOKEN`), it should be a fine-grained token with read-only *Pull requests* and *Contents* access.
 - Missing data or tooling is reported in `gaps`. The graph then degrades to REVIEW instead of reading the absence as clean.
 
+### Hardening (independent review, 2026-11-23)
+
+- **Repository boundary.** All requests, including head-file reads for a pull request from a fork, go to the configured repository. A fork's head commit is read through the base repository at its SHA, which GitHub serves for PR heads (verified against a public fork PR: base repository at the fork's head SHA returned 200, and an unknown SHA returned 404). `GitHubApi` refuses any other repository, so a token never reaches a fork. An unreadable head commit, or missing or malformed repository metadata, is a gap. A base repository that differs from the configured one is an error.
+- **Renames.** A renamed file is attributed at both its old and new paths. Its `previous_filename` must pass the same path checks as `filename`. A contract moved away from its declared path, or one with no usable base path, is a gap.
+- **Scanners.** oasdiff and gitleaks run from registry-digest-pinned images in locked-down, uniquely named containers that are always force-removed. Scanner output is parsed strictly. A timeout, failure or malformed output raises `ScannerError`, which becomes a gap. gitleaks gets an explicit default configuration and ignores PR-supplied `.gitleaks.toml`, `.gitleaksignore` and inline `gitleaks:allow` suppressions.
+
 ## Consequences
 
 ### Positive

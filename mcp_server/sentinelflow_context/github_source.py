@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -29,13 +30,18 @@ from typing import Any, Protocol
 
 import yaml
 from app.core.domain_pack import DomainPack, is_non_code_path
-from app.deterministic.contract_diff import OasDiffOptions, parse_oasdiff_output
+from app.deterministic.contract_diff import (
+    OasDiffOptions,
+    OasDiffOutputError,
+    parse_oasdiff_output,
+)
 from app.deterministic.dependency_graph import (
     build_dependency_graph,
     graph_edges,
     resolve_change_blast_radius,
     resolve_impacted_services,
 )
+from app.deterministic.docker_sandbox import Mount, image_present, run_sandboxed
 from app.deterministic.models import (
     ContractChange,
     ContractDiffResult,
@@ -43,9 +49,9 @@ from app.deterministic.models import (
     SecurityScanResult,
 )
 from app.deterministic.subprocess_util import (
+    CommandResult,
     command_available,
-    docker_available,
-    run_command,
+    run_command_safe,
 )
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -76,7 +82,20 @@ BLAST_RADIUS_MAX_DEPTH = 5
 CACHE_TTL_SECONDS = 300.0
 CACHE_MAX_ENTRIES = 16
 
-GITLEAKS_IMAGE = "zricethezav/gitleaks:v8.30.1"
+# Pinned by registry digest (OCI image index). The tag is informational; Docker
+# resolves the digest. A gitleaks binary on PATH is used only at this exact version.
+GITLEAKS_VERSION = "8.30.1"
+GITLEAKS_IMAGE = (
+    "zricethezav/gitleaks:v8.30.1"
+    "@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
+)
+# The scan target is a directory we own; PR files sit one level below it, so no PR
+# file can be the target's .gitleaksignore.
+GITLEAKS_TARGET = "/scan"
+GITLEAKS_STAGE_DIR = "repo"
+# gitleaks' built-in default rules, loaded explicitly so that a .gitleaks.toml in
+# the pull request is never picked up.
+GITLEAKS_CONFIG = "[extend]\nuseDefault = true\n"
 
 # Dependency manifests and lockfiles. A change to one needs a vulnerability scan,
 # which GitHub mode does not run, so it is recorded as a gap.
@@ -212,8 +231,20 @@ def _is_dependency_manifest(path: str) -> bool:
 # ------------------------------------------------------------------ signal tools
 
 
+class ScannerError(RuntimeError):
+    """A scanner ran but produced no trustworthy result (timeout, failure, bad output).
+
+    The message is fixed text naming the scanner and the reason. It never includes
+    scanner output, file contents or local paths.
+    """
+
+
 class SignalTools(Protocol):
-    """External deterministic tools. ``None`` means unavailable or failed."""
+    """External deterministic tools.
+
+    ``None`` means the tool is not installed. ``ScannerError`` means it was run but
+    gave no usable verdict. Neither is ever read as a clean result.
+    """
 
     def diff_openapi(self, base_spec: Path, revision_spec: Path) -> ContractDiffResult | None:
         """oasdiff verdict for two specs in the same directory."""
@@ -224,28 +255,45 @@ class SignalTools(Protocol):
         ...
 
 
-def _docker_image_present(image: str) -> bool:
-    if not docker_available():
-        return False
-    return run_command(["docker", "image", "inspect", image], timeout_seconds=30).ok
+class GitleaksReportError(ValueError):
+    """A gitleaks report that is not a list of finding objects."""
+
+
+# Prefixes gitleaks puts in front of the reported paths. They are stripped so that
+# findings carry repository-relative paths.
+_GITLEAKS_PATH_PREFIXES = (f"{GITLEAKS_TARGET}/{GITLEAKS_STAGE_DIR}/", f"{GITLEAKS_TARGET}/")
 
 
 def parse_gitleaks_report(payload: object, *, root: Path) -> SecurityScanResult:
-    """Normalize a gitleaks JSON report. Matched secret text is never copied."""
+    """Normalize a gitleaks JSON report strictly. Matched secret text is never copied.
+
+    The report must be a JSON list (``[]`` means no leaks) of objects that each
+    carry a string ``RuleID`` and ``File``. Anything else raises
+    ``GitleaksReportError``.
+    """
+    if not isinstance(payload, list):
+        msg = "gitleaks report is not a list"
+        raise GitleaksReportError(msg)
     findings: list[SecurityFindingRecord] = []
-    items = payload if isinstance(payload, list) else []
-    for index, item in enumerate(items):
+    root_prefix = root.as_posix().rstrip("/") + "/"
+    for index, item in enumerate(payload):
         if not isinstance(item, dict):
-            continue
-        rule_id = sanitize_text(item.get("RuleID") or "secret", limit=128)
-        raw_file = str(item.get("File") or "").replace("\\", "/")
-        root_posix = root.as_posix().rstrip("/") + "/"
-        for prefix in (root_posix, "/scan/"):
+            msg = "gitleaks finding is not an object"
+            raise GitleaksReportError(msg)
+        rule_raw, file_raw = item.get("RuleID"), item.get("File")
+        if not isinstance(rule_raw, str) or not rule_raw or not isinstance(file_raw, str):
+            msg = "gitleaks finding lacks a rule id or file"
+            raise GitleaksReportError(msg)
+        rule_id = sanitize_text(rule_raw, limit=128)
+        raw_file = file_raw.replace("\\", "/")
+        for prefix in (root_prefix, *_GITLEAKS_PATH_PREFIXES):
             if raw_file.startswith(prefix):
                 raw_file = raw_file[len(prefix) :]
+                break
         line = item.get("StartLine")
-        detail = sanitize_text(item.get("Description") or rule_id, limit=200)
-        if isinstance(line, int):
+        description = item.get("Description")
+        detail = sanitize_text(description if isinstance(description, str) else rule_id, limit=200)
+        if isinstance(line, int) and not isinstance(line, bool):
             detail = f"{detail} (line {line})"
         findings.append(
             SecurityFindingRecord(
@@ -265,11 +313,52 @@ def parse_gitleaks_report(payload: object, *, root: Path) -> SecurityScanResult:
     )
 
 
-class LocalSignalTools:
-    """oasdiff and gitleaks from PATH or locally present Docker images.
+def _gitleaks_binary_matches() -> bool:
+    """True when a ``gitleaks`` on PATH is exactly the pinned version."""
+    if not command_available("gitleaks"):
+        return False
+    result = run_command_safe(["gitleaks", "version"], timeout_seconds=15)
+    return result.ok and result.stdout.strip().lstrip("v") == GITLEAKS_VERSION
 
-    Images are never pulled implicitly (``--pull=never``), containers run without
-    network, and any non-success exit is reported as unavailable, not as "clean".
+
+def _gitleaks_args(*, target: str, config: str, ignore_dir: str, report: str) -> list[str]:
+    """Deterministic gitleaks arguments that a pull request cannot influence.
+
+    gitleaks would otherwise read ``.gitleaks.toml`` and ``.gitleaksignore`` from
+    the scan target and honour inline ``gitleaks:allow`` comments, all of which a
+    PR controls. Pinning ``--config`` (the built-in default rules), pointing the
+    ignore path at a directory we own, staging PR files one level below the target
+    and ignoring inline allow comments closes all three. The default rule
+    allowlists themselves are unchanged.
+    """
+    return [
+        "dir", target,
+        "--config", config,
+        "--gitleaks-ignore-path", ignore_dir,
+        "--ignore-gitleaks-allow",
+        "--report-path", report,
+        "--report-format", "json",
+        "--exit-code", "2",
+        "--no-banner",
+        "--redact",
+    ]  # fmt: skip
+
+
+def _raise_for_scanner_result(tool: str, result: CommandResult) -> None:
+    if result.timed_out:
+        msg = f"{tool} timed out"
+        raise ScannerError(msg)
+    if not result.ok:
+        msg = f"{tool} failed"
+        raise ScannerError(msg)
+
+
+class LocalSignalTools:
+    """oasdiff and gitleaks from pinned local Docker images (or a pinned gitleaks binary).
+
+    Images are never pulled, and containers run locked down (see
+    ``app.deterministic.docker_sandbox``). Missing tools return ``None``. A
+    timeout, a non-success exit or unparseable output raises ``ScannerError``.
     """
 
     def __init__(self, *, timeout_seconds: int = 120) -> None:
@@ -277,43 +366,81 @@ class LocalSignalTools:
 
     def diff_openapi(self, base_spec: Path, revision_spec: Path) -> ContractDiffResult | None:
         image = OasDiffOptions().docker_image
-        if not _docker_image_present(image):
+        if not image_present(image):
             return None
-        mount = base_spec.parent.resolve()
-        argv = [
-            "docker", "run", "--rm", "--network=none", "--pull=never",
-            "-v", f"{mount}:/specs:ro", "-w", "/specs", image,
-            "breaking", base_spec.name, revision_spec.name, "--format", "json",
-        ]  # fmt: skip
-        result = run_command(argv, timeout_seconds=self._timeout)
-        if not result.ok:
-            return None
-        return parse_oasdiff_output(result.stdout)
+        result = run_sandboxed(
+            image=image,
+            command=["breaking", base_spec.name, revision_spec.name, "--format", "json"],
+            mounts=[Mount(base_spec.parent, "/specs")],
+            workdir="/specs",
+            timeout_seconds=self._timeout,
+        )
+        _raise_for_scanner_result("oasdiff", result)
+        try:
+            return parse_oasdiff_output(result.stdout)
+        except OasDiffOutputError as exc:
+            msg = "oasdiff returned invalid output"
+            raise ScannerError(msg) from exc
 
     def scan_secrets(self, root: Path) -> SecurityScanResult | None:
-        with tempfile.TemporaryDirectory(prefix="sf-gitleaks-") as report_dir:
-            report = Path(report_dir) / "report.json"
-            common = ["--report-format", "json", "--exit-code", "2", "--no-banner", "--redact"]
-            if command_available("gitleaks"):
-                argv = ["gitleaks", "dir", str(root), "--report-path", str(report), *common]
-            elif _docker_image_present(GITLEAKS_IMAGE):
-                argv = [
-                    "docker", "run", "--rm", "--network=none", "--pull=never",
-                    "-v", f"{root.resolve()}:/scan:ro",
-                    "-v", f"{Path(report_dir).resolve()}:/report",
-                    GITLEAKS_IMAGE, "dir", "/scan", "--report-path", "/report/report.json", *common,
-                ]  # fmt: skip
+        use_image = image_present(GITLEAKS_IMAGE)
+        if not use_image and not _gitleaks_binary_matches():
+            return None
+        with tempfile.TemporaryDirectory(prefix="sf-gitleaks-") as work_dir:
+            work = Path(work_dir)
+            config_dir, report_dir = work / "config", work / "report"
+            config_dir.mkdir()
+            report_dir.mkdir()
+            (config_dir / "gitleaks.toml").write_text(GITLEAKS_CONFIG, encoding="utf-8")
+            report = report_dir / "report.json"
+            if use_image:
+                result = run_sandboxed(
+                    image=GITLEAKS_IMAGE,
+                    command=_gitleaks_args(
+                        target=GITLEAKS_TARGET,
+                        config="/config/gitleaks.toml",
+                        ignore_dir="/config",
+                        report="/report/report.json",
+                    ),
+                    mounts=[
+                        Mount(root, f"{GITLEAKS_TARGET}/{GITLEAKS_STAGE_DIR}"),
+                        Mount(config_dir, "/config"),
+                        Mount(report_dir, "/report", read_only=False),
+                    ],
+                    timeout_seconds=self._timeout,
+                )
+                report_root = root
             else:
-                return None
-            result = run_command(argv, timeout_seconds=self._timeout)
+                target = work / "target"
+                shutil.copytree(root, target / GITLEAKS_STAGE_DIR)
+                argv = [
+                    "gitleaks",
+                    *_gitleaks_args(
+                        target=str(target),
+                        config=str(config_dir / "gitleaks.toml"),
+                        ignore_dir=str(config_dir),
+                        report=str(report),
+                    ),
+                ]
+                result = run_command_safe(argv, timeout_seconds=self._timeout)
+                report_root = target / GITLEAKS_STAGE_DIR
+            if result.timed_out:
+                msg = "gitleaks timed out"
+                raise ScannerError(msg)
             # --exit-code 2 separates "leaks found" (2) from tool errors (1).
-            if result.returncode not in {0, 2} or not report.is_file():
-                return None
+            if result.launch_failed or result.returncode not in {0, 2}:
+                msg = "gitleaks failed"
+                raise ScannerError(msg)
             try:
-                payload = json.loads(report.read_text(encoding="utf-8") or "[]")
-            except ValueError:
-                return None
-            return parse_gitleaks_report(payload, root=root)
+                payload = json.loads(report.read_text(encoding="utf-8"))
+                scanned = parse_gitleaks_report(payload, root=report_root)
+            except (OSError, ValueError) as exc:
+                msg = "gitleaks returned no valid report"
+                raise ScannerError(msg) from exc
+            if result.returncode == 2 and not scanned.findings:
+                msg = "gitleaks reported leaks but listed none"
+                raise ScannerError(msg)
+            return scanned
 
 
 _tools_override: SignalTools | None = None
@@ -399,6 +526,16 @@ def _sha(value: object, *, what: str) -> str:
     return value
 
 
+# GitHub file statuses whose previous_filename names the original of the file.
+_STATUSES_WITH_PREVIOUS = frozenset({"renamed", "copied"})
+
+
+def _repository_name(repo: object) -> str | None:
+    """``full_name`` of a GitHub repository object, if present and well formed."""
+    name = repo.get("full_name") if isinstance(repo, dict) else None
+    return name if isinstance(name, str) and REPOSITORY_PATTERN.match(name) else None
+
+
 def _resolve(
     api: GitHubApi,
     *,
@@ -415,16 +552,39 @@ def _resolve(
     head: dict[str, Any] = head_obj if isinstance(head_obj, dict) else {}
     base_sha = _sha(base.get("sha"), what="base commit")
     head_sha = _sha(head.get("sha"), what="head commit")
-    head_repo_obj = head.get("repo")
-    head_name = head_repo_obj.get("full_name") if isinstance(head_repo_obj, dict) else None
-    head_repo: str | None = (
-        head_name if isinstance(head_name, str) and REPOSITORY_PATTERN.match(head_name) else None
-    )
     declared_files = pr.get("changed_files")
     declared = declared_files if isinstance(declared_files, int) and declared_files >= 0 else None
 
     gaps: list[str] = []
     notes: list[str] = list(GITHUB_NOTES)
+
+    # Repository boundary. Every request goes to the configured repository, also for
+    # a pull request from a fork. GitHub serves a fork PR's head commit through the
+    # base repository (refs/pull/<n>/head), and the token never reaches the fork. If
+    # the head commit is not readable there, the reads fail and become gaps.
+    base_name = _repository_name(base.get("repo"))
+    if base_name is None:
+        gaps.append("GitHub did not report the pull request's base repository")
+    elif base_name.casefold() != repository.casefold():
+        msg = "GitHub API returned a pull request whose base is a different repository"
+        raise ToolError(msg)
+    head_name = _repository_name(head.get("repo"))
+    from_fork = head_name is None or head_name.casefold() != repository.casefold()
+    if head_name is None:
+        gaps.append(
+            "head repository unavailable or malformed (for example a deleted fork); "
+            "head files were read from the configured repository at the head commit",
+        )
+    elif from_fork:
+        notes.append(
+            "pull request comes from a fork; head files were read from the configured "
+            "repository at the head commit, never from the fork",
+        )
+    fork_hint = (
+        "; a fork's head commit may not be readable through the configured repository"
+        if from_fork
+        else ""
+    )
 
     raw_files = api.list_pull_request_files(repository, number, max_files=MAX_FILES)
     if declared is None:
@@ -442,12 +602,26 @@ def _resolve(
         if path is None:
             rejected_paths += 1
             continue
-        previous = item.get("previous_filename")
+        status = str(item.get("status") or "modified")
+        raw_previous = item.get("previous_filename")
+        previous = safe_repo_path(raw_previous) if raw_previous is not None else None
+        # A renamed or copied file must name a safe original; never guess it.
+        previous_unusable = (raw_previous is not None and previous is None) or (
+            status in _STATUSES_WITH_PREVIOUS and previous is None
+        )
+        if previous_unusable:
+            gaps.append(
+                f"{status} file '{path}' has a missing, unsafe or invalid previous path; "
+                "its original location was not analysed",
+            )
         files.append(
             {
                 "path": path,
-                "status": str(item.get("status") or "modified"),
-                "previous": safe_repo_path(previous) if previous is not None else None,
+                "status": status,
+                "previous": previous,
+                "previous_unusable": previous_unusable,
+                # A rename removes the old path, so it is part of what changed.
+                "moved_from": previous if status == "renamed" else None,
                 "has_patch": isinstance(item.get("patch"), str),
                 "changes": item.get("changes") if isinstance(item.get("changes"), int) else 0,
             },
@@ -460,22 +634,31 @@ def _resolve(
     rules = pack.domain.non_code_paths
     owners: dict[str, str] = {}
     unmapped: list[str] = []
+    touched: list[str] = []
     for entry in files:
-        service = live.service_for(entry["path"])
-        if service is None:
-            unmapped.append(entry["path"])
-            if not is_non_code_path(entry["path"], rules):
+        for path in (entry["path"], entry["moved_from"]):
+            if path is None or path in touched:
+                continue
+            touched.append(path)
+            service = live.service_for(path)
+            if service is None:
+                unmapped.append(path)
+                if not is_non_code_path(path, rules):
+                    gaps.append(
+                        f"changed file '{path}' is not attributed to any service in "
+                        f"pack '{pack.pack_id}', so its blast radius is unknown",
+                    )
+            else:
+                owners[path] = service
+        manifests = [entry["moved_from"]]
+        if entry["status"] != "removed":
+            manifests.append(entry["path"])
+        for path in manifests:
+            if path is not None and _is_dependency_manifest(path):
                 gaps.append(
-                    f"changed file '{entry['path']}' is not attributed to any service in "
-                    f"pack '{pack.pack_id}', so its blast radius is unknown",
+                    f"dependency manifest '{path}' changed; GitHub mode does not run a "
+                    "dependency vulnerability scan",
                 )
-        else:
-            owners[entry["path"]] = service
-        if _is_dependency_manifest(entry["path"]) and entry["status"] != "removed":
-            gaps.append(
-                f"dependency manifest '{entry['path']}' changed; GitHub mode does not run a "
-                "dependency vulnerability scan",
-            )
     if not owners:
         msg = (
             f"pull request #{number} changes no file owned by a service in domain pack "
@@ -497,37 +680,55 @@ def _resolve(
         if node not in origin_nodes:
             origin_nodes.append(node)
 
-    # Contract compatibility: base vs head of each configured contract file that changed.
+    # Contract compatibility: the base version of each changed contract (at its
+    # original path for a rename or copy) against its head version.
     contract_results: list[ContractDiffResult] = []
     contract_touched = False
     for entry in files:
-        path = entry["path"]
-        if path not in owners or not live.is_contract(path):
+        path, status, moved_from = entry["path"], entry["status"], entry["moved_from"]
+        if moved_from is not None and moved_from != path and live.is_contract(moved_from):
+            contract_touched = True
+            gaps.append(
+                f"contract '{moved_from}' was renamed to '{path}', away from its declared "
+                "path, so the declared contract is no longer where the pack expects it",
+            )
+        if not live.is_contract(path):
             continue
         contract_touched = True
-        if entry["status"] == "added":
+        if status == "added":
             notes.append(f"contract '{path}' is new; there is no base version to diff")
             continue
-        if entry["status"] == "removed":
+        if status == "removed":
             gaps.append(f"contract '{path}' was removed; compatibility was not computed")
             continue
-        if head_repo is None:
-            gaps.append(f"head repository unavailable; contract '{path}' was not diffed")
+        if entry["previous_unusable"]:
+            gaps.append(f"contract '{path}' has no usable base path; not diffed")
             continue
+        base_path = entry["previous"] if status in _STATUSES_WITH_PREVIOUS else path
         try:
             base_bytes = api.get_file_content(
-                repository, entry["previous"] or path, ref=base_sha, max_bytes=MAX_FILE_BYTES
-            )
-            head_bytes = api.get_file_content(
-                head_repo, path, ref=head_sha, max_bytes=MAX_FILE_BYTES
+                repository, base_path, ref=base_sha, max_bytes=MAX_FILE_BYTES
             )
         except (GitHubNotFoundError, GitHubContentTooLargeError) as exc:
-            gaps.append(f"contract '{path}' could not be read ({exc}); not diffed")
+            gaps.append(f"contract '{path}' base version could not be read ({exc}); not diffed")
+            continue
+        try:
+            head_bytes = api.get_file_content(
+                repository, path, ref=head_sha, max_bytes=MAX_FILE_BYTES
+            )
+        except (GitHubNotFoundError, GitHubContentTooLargeError) as exc:
+            gaps.append(
+                f"contract '{path}' head version could not be read ({exc}{fork_hint}); not diffed",
+            )
             continue
         with _workspace() as tmp:
             (tmp / "base.yaml").write_bytes(base_bytes)
             (tmp / "revision.yaml").write_bytes(head_bytes)
-            result = tools.diff_openapi(tmp / "base.yaml", tmp / "revision.yaml")
+            try:
+                result = tools.diff_openapi(tmp / "base.yaml", tmp / "revision.yaml")
+            except ScannerError as exc:
+                gaps.append(f"{exc}; compatibility of contract '{path}' not computed")
+                continue
         if result is None:
             gaps.append(f"oasdiff unavailable; compatibility of contract '{path}' not computed")
             continue
@@ -542,19 +743,19 @@ def _resolve(
     # Secret scan over the head version of every added or modified file.
     to_scan = [entry for entry in files if entry["status"] != "removed"]
     security = SecurityScanResult()
-    if to_scan and head_repo is None:
-        gaps.append("head repository unavailable; changed files were not scanned for secrets")
-    elif to_scan and head_repo is not None:
+    if to_scan:
         with _workspace() as tmp:
             total = 0
             written = 0
             for entry in to_scan:
                 try:
                     data = api.get_file_content(
-                        head_repo, entry["path"], ref=head_sha, max_bytes=MAX_FILE_BYTES
+                        repository, entry["path"], ref=head_sha, max_bytes=MAX_FILE_BYTES
                     )
                 except (GitHubNotFoundError, GitHubContentTooLargeError) as exc:
-                    gaps.append(f"'{entry['path']}' could not be read for scanning ({exc})")
+                    gaps.append(
+                        f"'{entry['path']}' could not be read for scanning ({exc}{fork_hint})",
+                    )
                     continue
                 total += len(data)
                 if total > MAX_TOTAL_SCAN_BYTES:
@@ -570,11 +771,17 @@ def _resolve(
                     continue
                 written += 1
             if written:
-                scanned = tools.scan_secrets(tmp)
-                if scanned is None:
-                    gaps.append("gitleaks unavailable; changed files were not scanned for secrets")
+                try:
+                    scanned = tools.scan_secrets(tmp)
+                except ScannerError as exc:
+                    gaps.append(f"{exc}; changed files were not scanned for secrets")
                 else:
-                    security = scanned
+                    if scanned is None:
+                        gaps.append(
+                            "gitleaks unavailable; changed files were not scanned for secrets",
+                        )
+                    else:
+                        security = scanned
     else:
         notes.append("no added or modified files to scan for secrets")
 
@@ -586,7 +793,7 @@ def _resolve(
         description="",
         category="unknown",
         primary_service=primary,
-        changed_files=sorted(entry["path"] for entry in files),
+        changed_files=sorted(touched),
         origin_nodes=origin_nodes,
         github=GitHubPullRequestRef(
             repository=repository,
@@ -635,6 +842,7 @@ def resolve_github_change(
         base_url=settings.github_api_url,
         token=settings.github_token,
         timeout_seconds=settings.github_timeout_seconds,
+        allowed_repository=live.repository,
     ) as api:
         resolved = _resolve(
             api,

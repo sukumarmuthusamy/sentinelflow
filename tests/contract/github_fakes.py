@@ -14,6 +14,7 @@ import httpx
 from app.deterministic.contract_diff import parse_oasdiff_output
 from app.deterministic.models import ContractDiffResult, SecurityScanResult
 from mcp_server.sentinelflow_context import github_api, github_source
+from mcp_server.sentinelflow_context.github_source import ScannerError
 
 RECORDED = (
     Path(__file__).resolve().parents[1] / "fixtures" / "github" / "sentinelflow-demo-platform"
@@ -113,12 +114,17 @@ class FakeSignalTools:
         self.secrets = secrets if secrets is not None else SecurityScanResult()
         self.contract_unavailable = False
         self.scanner_unavailable = False
+        # Simulate a tool that ran but gave no verdict (timeout, failure, bad output).
+        self.contract_error: str | None = None
+        self.scanner_error: str | None = None
         self.diffed: list[tuple[bytes, bytes]] = []
         self.scanned_files: list[str] = []
         self.scanned_roots: list[Path] = []
 
     def diff_openapi(self, base_spec: Path, revision_spec: Path) -> ContractDiffResult | None:
         self.diffed.append((base_spec.read_bytes(), revision_spec.read_bytes()))
+        if self.contract_error is not None:
+            raise ScannerError(self.contract_error)
         return None if self.contract_unavailable else self.contract
 
     def scan_secrets(self, root: Path) -> SecurityScanResult | None:
@@ -126,6 +132,8 @@ class FakeSignalTools:
         self.scanned_files.extend(
             sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file())
         )
+        if self.scanner_error is not None:
+            raise ScannerError(self.scanner_error)
         return None if self.scanner_unavailable else self.secrets
 
 

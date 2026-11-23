@@ -91,7 +91,17 @@ def raise_for_github_status(response: httpx.Response, *, what: str) -> None:
 class GitHubApi:
     """Minimal GET-only client for pull requests, their files and file contents."""
 
-    def __init__(self, *, base_url: str, token: str | None, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        token: str | None,
+        timeout_seconds: float,
+        allowed_repository: str | None = None,
+    ) -> None:
+        # When set, every request must target this repository (case-insensitive), so
+        # the token can never be sent to another repository, such as a PR's fork.
+        self._allowed = allowed_repository.casefold() if allowed_repository else None
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": API_VERSION,
@@ -118,6 +128,14 @@ class GitHubApi:
         tb: TracebackType | None,
     ) -> None:
         self._client.close()
+
+    def _check_repository(self, repository: str) -> None:
+        if not REPOSITORY_PATTERN.match(repository):
+            msg = "refusing a GitHub request for a malformed repository name"
+            raise ToolError(msg)
+        if self._allowed is not None and repository.casefold() != self._allowed:
+            msg = "refusing a GitHub request outside the configured repository"
+            raise ToolError(msg)
 
     def _get_bytes(
         self,
@@ -168,6 +186,7 @@ class GitHubApi:
             raise ToolError(msg) from exc
 
     def get_pull_request(self, repository: str, number: int) -> dict[str, Any]:
+        self._check_repository(repository)
         what = f"pull request #{number} in {repository}"
         payload = self._get_json(f"/repos/{repository}/pulls/{number}", what=what)
         if not isinstance(payload, dict):
@@ -183,6 +202,7 @@ class GitHubApi:
         max_files: int,
     ) -> list[dict[str, Any]]:
         """Return up to ``max_files`` changed-file records, following pagination."""
+        self._check_repository(repository)
         what = f"files of pull request #{number} in {repository}"
         files: list[dict[str, Any]] = []
         page = 1
@@ -210,6 +230,7 @@ class GitHubApi:
         max_bytes: int,
     ) -> bytes:
         """Raw file bytes at ``ref``; raises GitHubNotFoundError if absent there."""
+        self._check_repository(repository)
         what = f"file '{path}' at {ref[:12]}"
         return self._get_bytes(
             f"/repos/{repository}/contents/{quote(path, safe='/')}",
