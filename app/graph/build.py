@@ -16,6 +16,7 @@ from app.graph.nodes import (
     deterministic_signal_layer,
     evidence_verifier_node,
     focused_retrieval_repair,
+    gate_router,
     human_approval_node,
     intake_validator,
     merge_findings,
@@ -89,10 +90,24 @@ def build_analysis_graph(
     graph.add_edge("intake_validator", "deterministic_signals")
     graph.add_edge("deterministic_signals", "budget_guard")
     graph.add_edge("budget_guard", "check_remaining_steps")
-    graph.add_edge("check_remaining_steps", "triage_planner")
-    graph.add_conditional_edges("triage_planner", plan_fan_out, ["run_parallel_agent"])
+    # Once degraded, later LLM-calling nodes are skipped: degradation already means
+    # "a human must look", so more agent output cannot change that outcome.
+    graph.add_conditional_edges(
+        "check_remaining_steps",
+        gate_router,
+        {"continue": "triage_planner", "degrade_review": "degrade_review"},
+    )
+    graph.add_conditional_edges(
+        "triage_planner",
+        plan_fan_out,
+        ["run_parallel_agent", "degrade_review"],
+    )
     graph.add_edge("run_parallel_agent", "merge_findings")
-    graph.add_edge("merge_findings", "evidence_verifier")
+    graph.add_conditional_edges(
+        "merge_findings",
+        gate_router,
+        {"continue": "evidence_verifier", "degrade_review": "degrade_review"},
+    )
     graph.add_conditional_edges(
         "evidence_verifier",
         coverage_router,
@@ -102,7 +117,11 @@ def build_analysis_graph(
             "degrade_review": "degrade_review",
         },
     )
-    graph.add_edge("focused_retrieval_repair", "evidence_verifier")
+    graph.add_conditional_edges(
+        "focused_retrieval_repair",
+        gate_router,
+        {"continue": "evidence_verifier", "degrade_review": "degrade_review"},
+    )
     graph.add_edge("risk_engine", "report_builder")
     graph.add_edge("degrade_review", "report_builder")
     graph.add_edge("report_builder", "human_approval")

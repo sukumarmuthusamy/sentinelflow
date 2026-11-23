@@ -15,7 +15,7 @@ from app.core.domain_pack import load_domain_pack
 from app.core.settings import Settings, get_settings
 from app.graph.budget import AnalysisBudget
 from app.graph.build import build_analysis_graph
-from app.graph.context import AnalysisGraphContext
+from app.graph.context import AnalysisGraphContext, EvidenceRetriever
 from app.graph.state import AnalysisRequest
 from app.graph.typed_state import GraphState
 from app.mcp_client.port import McpClientPort
@@ -47,7 +47,8 @@ def _initial_state(request: AnalysisRequest, analysis_id: str | None = None) -> 
         "verification": None,
         "risk_assessment": None,
         "retrieved_evidence_ids": [],
-        "retrieved_chunks": None,
+        "retrieved_chunks": [],
+        "injection_evidence_ids": [],
         "evidence_gaps": [],
         "repair_count": 0,
         "approval_status": "not_requested",
@@ -69,20 +70,27 @@ async def build_analysis_context(
     llm: StructuredLLM,
     settings: Settings | None = None,
     enable_retrieval: bool = True,
-) -> AnalysisGraphContext:
+    retriever: EvidenceRetriever | None = None,
+) -> tuple[AnalysisGraphContext, RetrievalService | None]:
+    """Build node dependencies; also return the retrieval service this call owns.
+
+    A caller-supplied ``retriever`` is used as-is and not closed here.
+    """
     cfg = settings or get_settings()
     pack = load_domain_pack(request.domain_pack_id, domains_root=cfg.domains_root)
-    retrieval: RetrievalService | None = None
-    if enable_retrieval:
+    owned: RetrievalService | None = None
+    retrieval: EvidenceRetriever | None = retriever
+    if retrieval is None and enable_retrieval:
         backend = VectorStoreBackend(cfg.vector_store_backend)
-        retrieval = RetrievalService(
+        owned = RetrievalService(
             domain_pack_id=request.domain_pack_id,
             backend=backend,
             reranker_mode=RerankerMode.NONE,
             settings=cfg,
         )
-        await retrieval.initialize()
-    return AnalysisGraphContext(
+        await owned.initialize()
+        retrieval = owned
+    context = AnalysisGraphContext(
         domain_pack=pack,
         mcp=mcp,
         llm=llm,
@@ -92,6 +100,7 @@ async def build_analysis_context(
         triage_model=cfg.triage_llm_model,
         agent_temperature=cfg.agent_llm_temperature,
     )
+    return context, owned
 
 
 def restore_counters(context: AnalysisGraphContext, values: dict[str, Any]) -> None:
@@ -109,6 +118,7 @@ def restore_counters(context: AnalysisGraphContext, values: dict[str, Any]) -> N
         "input_tokens",
         "output_tokens",
         "citations_rejected",
+        "repair_count",
     ):
         setattr(context.trace, name, int(trace.get(name) or 0))
     context.budget.llm_calls = context.trace.llm_calls
@@ -125,15 +135,17 @@ async def run_analysis(
     analysis_id: str | None = None,
     settings: Settings | None = None,
     enable_retrieval: bool = True,
+    retriever: EvidenceRetriever | None = None,
 ) -> dict[str, Any]:
     """Execute the graph until completion or interrupt."""
     cfg = settings or get_settings()
-    context = await build_analysis_context(
+    context, owned = await build_analysis_context(
         request,
         mcp=mcp,
         llm=llm,
         settings=cfg,
         enable_retrieval=enable_retrieval,
+        retriever=retriever,
     )
     config: RunnableConfig = {
         "configurable": {
@@ -153,8 +165,8 @@ async def run_analysis(
             )
             return result
     finally:
-        if context.retrieval is not None:
-            await context.retrieval.close()
+        if owned is not None:
+            await owned.close()
 
 
 async def resume_analysis(
@@ -166,15 +178,17 @@ async def resume_analysis(
     resume_payload: dict[str, Any],
     settings: Settings | None = None,
     enable_retrieval: bool = True,
+    retriever: EvidenceRetriever | None = None,
 ) -> dict[str, Any]:
     """Resume after human approval interrupt."""
     cfg = settings or get_settings()
-    context = await build_analysis_context(
+    context, owned = await build_analysis_context(
         request,
         mcp=mcp,
         llm=llm,
         settings=cfg,
         enable_retrieval=enable_retrieval,
+        retriever=retriever,
     )
     config: RunnableConfig = {
         "configurable": {
@@ -194,5 +208,5 @@ async def resume_analysis(
                 durability="sync",
             )
     finally:
-        if context.retrieval is not None:
-            await context.retrieval.close()
+        if owned is not None:
+            await owned.close()

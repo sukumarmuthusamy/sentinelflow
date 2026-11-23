@@ -22,8 +22,10 @@ from app.agents.mcp_tools import (
     mcp_test_strategist_context,
 )
 from app.agents.prompts import PROMPT_VERSION
-from app.agents.prompts import v2 as prompts
+from app.agents.prompts import v3 as prompts
 from app.graph.budget import AnalysisBudget, TraceAccumulator
+from app.graph.context import EvidenceRetriever
+from app.graph.evidence_context import VerifierEvidence
 from app.graph.evidence_ids import (
     collect_retrieved_evidence_ids,
     evidence_id_from_metadata,
@@ -31,12 +33,12 @@ from app.graph.evidence_ids import (
     filter_verification_report,
     validate_bundle_citations,
 )
+from app.graph.injection import looks_like_injection
 from app.graph.state import AnalysisPlan, AnalysisRequest
-from app.graph.verification import MaterialAssertion
+from app.graph.verification import MaterialAssertion, ground_report
 from app.mcp_client.port import McpClientPort
 from app.model_gateway.llm import StructuredLLM
 from app.rag.models import DocumentType, RetrievedChunk
-from app.rag.retrieval import RetrievalService
 
 SECURITY_DOCUMENT_TYPES: frozenset[DocumentType] = frozenset(
     {DocumentType.INCIDENT, DocumentType.RUNBOOK, DocumentType.RELEASE_POLICY},
@@ -50,6 +52,31 @@ class RetrievalOutcome:
     allowed_ids: set[str] = field(default_factory=set)
     chunks: list[RetrievedChunk] = field(default_factory=list)
     rejected_ids: list[str] = field(default_factory=list)
+    # Retrieved chunks withheld from every prompt because they contain instruction-like text.
+    injection_ids: list[str] = field(default_factory=list)
+
+
+def screen_chunks(chunks: list[RetrievedChunk]) -> tuple[list[RetrievedChunk], list[str]]:
+    """Split retrieved chunks into clean ones and IDs of instruction-like ones."""
+    clean: list[RetrievedChunk] = []
+    flagged: list[str] = []
+    for chunk in chunks:
+        if looks_like_injection(chunk.content):
+            flagged.append(evidence_id_from_metadata(chunk.metadata))
+        else:
+            clean.append(chunk)
+    return clean, flagged
+
+
+@dataclass
+class VerifierOutcome:
+    """Citation-filtered, source-grounded verifier report."""
+
+    report: VerificationReport
+    # Cited IDs that were not among the chunks shown to the verifier.
+    rejected_ids: list[str]
+    # "supported" judgments demoted because the shown source text did not back them.
+    grounding_rejections: list[str]
 
 
 async def _generate[T: BaseModel](
@@ -140,7 +167,7 @@ async def run_change_analyst(
 
 async def run_evidence_investigator(
     llm: StructuredLLM,
-    retrieval: RetrievalService,
+    retrieval: EvidenceRetriever,
     *,
     budget: AnalysisBudget,
     trace: TraceAccumulator,
@@ -158,6 +185,7 @@ async def run_evidence_investigator(
             if key not in seen:
                 seen.add(key)
                 chunks.append(chunk)
+    chunks, flagged = screen_chunks(chunks)
     allowed = collect_retrieved_evidence_ids(chunks)
     chunk_payload = [
         {
@@ -177,7 +205,7 @@ async def run_evidence_investigator(
         user_prompt=json.dumps(
             {
                 "focus_queries": {f"q{i}": query for i, query in enumerate(queries)},
-                "retrieved_chunks": chunk_payload,
+                "untrusted_retrieved_documents": chunk_payload,
             },
             indent=2,
         ),
@@ -186,7 +214,12 @@ async def run_evidence_investigator(
     validated, rejected = validate_bundle_citations(bundle, allowed)
     trace.citations_rejected += len(rejected)
     validated = validated.model_copy(update={"retrieval_queries": list(queries)})
-    return validated, RetrievalOutcome(allowed_ids=allowed, chunks=chunks, rejected_ids=rejected)
+    return validated, RetrievalOutcome(
+        allowed_ids=allowed,
+        chunks=chunks,
+        rejected_ids=rejected,
+        injection_ids=flagged,
+    )
 
 
 async def run_test_strategist(
@@ -199,13 +232,13 @@ async def run_test_strategist(
     temperature: float,
     request: AnalysisRequest,
 ) -> RegressionPlan:
-    trace.mcp_tool_calls += 1 if not request.execute_tests else 2
     context = await mcp_test_strategist_context(
         mcp,
         change_id=request.change_id,
         domain_pack_id=request.domain_pack_id,
         execute_tests=request.execute_tests,
     )
+    trace.mcp_tool_calls += 2 if "run_tests" in context else 1
     plan = await _generate(
         llm,
         budget=budget,
@@ -228,7 +261,7 @@ async def run_test_strategist(
 async def run_security_auditor(
     llm: StructuredLLM,
     mcp: McpClientPort,
-    retrieval: RetrievalService | None,
+    retrieval: EvidenceRetriever | None,
     *,
     budget: AnalysisBudget,
     trace: TraceAccumulator,
@@ -249,8 +282,9 @@ async def run_security_auditor(
         for chunk in await retrieval.retrieve(security_query):
             if chunk.metadata.document_type in SECURITY_DOCUMENT_TYPES:
                 security_chunks.append(chunk)
+    security_chunks, flagged = screen_chunks(security_chunks)
     allowed = collect_retrieved_evidence_ids(security_chunks)
-    context["security_retrieval"] = [
+    context["untrusted_retrieved_documents"] = [
         {
             "evidence_id": evidence_id_from_metadata(chunk.metadata),
             "content": chunk.content,
@@ -269,7 +303,12 @@ async def run_security_auditor(
     )
     filtered, rejected = filter_security_findings(findings.findings, allowed)
     trace.citations_rejected += len(rejected)
-    outcome = RetrievalOutcome(allowed_ids=allowed, chunks=security_chunks, rejected_ids=rejected)
+    outcome = RetrievalOutcome(
+        allowed_ids=allowed,
+        chunks=security_chunks,
+        rejected_ids=rejected,
+        injection_ids=flagged,
+    )
     return findings.model_copy(update={"findings": filtered}), outcome
 
 
@@ -280,14 +319,39 @@ async def run_evidence_verifier(
     trace: TraceAccumulator,
     model: str,
     temperature: float,
-    allowed_ids: set[str],
     assertions: list[MaterialAssertion],
+    evidence: VerifierEvidence,
     specialist_payload: dict[str, Any],
-) -> tuple[VerificationReport, list[str]]:
+) -> VerifierOutcome:
+    """Verify assertions against the shown source text, then ground in code.
+
+    The verifier may cite only chunks it was shown. A "supported" judgment survives
+    only if its supporting quote is found in a cited chunk (``ground_report``).
+    """
+    shown_ids = evidence.shown_ids
     user = json.dumps(
         {
-            "material_assertions": [assertion.model_dump() for assertion in assertions],
-            "allowed_evidence_ids": sorted(allowed_ids),
+            "material_assertions": [
+                {
+                    "assertion_id": assertion.assertion_id,
+                    "text": assertion.text,
+                    "severity": assertion.severity,
+                    "source": assertion.source,
+                    "specialist_cited_evidence_ids": [
+                        eid for eid in assertion.cited_evidence_ids if eid in shown_ids
+                    ],
+                }
+                for assertion in assertions
+            ],
+            "untrusted_retrieved_documents": [
+                {
+                    "evidence_id": chunk.evidence_id,
+                    "document_type": chunk.document_type,
+                    "service": chunk.service,
+                    "content": chunk.content,
+                }
+                for chunk in evidence.shown
+            ],
             "specialist_outputs": specialist_payload,
         },
         indent=2,
@@ -303,6 +367,11 @@ async def run_evidence_verifier(
         user_prompt=user,
         schema=VerificationReport,
     )
-    filtered, rejected = filter_verification_report(report, allowed_ids)
+    filtered, rejected = filter_verification_report(report, shown_ids)
     trace.citations_rejected += len(rejected)
-    return filtered, rejected
+    grounded, grounding_rejections = ground_report(filtered, assertions, evidence.content_by_id())
+    return VerifierOutcome(
+        report=grounded,
+        rejected_ids=rejected,
+        grounding_rejections=grounding_rejections,
+    )

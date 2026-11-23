@@ -236,6 +236,8 @@ class StaticStructuredLLM:
         self._input_tokens = input_tokens
         self._output_tokens = output_tokens
         self.calls: list[str] = []
+        # (schema name, system prompt, user prompt) per call, for prompt-content tests.
+        self.prompts: list[tuple[str, str, str]] = []
 
     async def generate(
         self,
@@ -246,12 +248,13 @@ class StaticStructuredLLM:
         user_prompt: str,
         schema: type[T],
     ) -> LLMResult[T]:
-        _ = (model, temperature, system_prompt, user_prompt)
+        _ = (model, temperature)
         payload = self._responses.get(schema)
         if payload is None:
             msg = f"No static response registered for {schema.__name__}"
             raise KeyError(msg)
         self.calls.append(schema.__name__)
+        self.prompts.append((schema.__name__, system_prompt, user_prompt))
         return LLMResult(
             value=cast(T, payload.model_copy(deep=True)),
             input_tokens=self._input_tokens,

@@ -39,7 +39,5 @@ def test_call_budget_enforced() -> None:
         budget.check_llm_call()
 
 
-def test_parallel_slot_limit() -> None:
-    budget = _budget(max_parallel_agents=1)
-    with budget.parallel_slot(), pytest.raises(BudgetExhaustedError), budget.parallel_slot():
-        pass
+# Parallel-agent limits are a semaphore in the graph context, covered by
+# tests/graph/test_degradation_paths.py::test_parallel_limit_throttles_instead_of_crashing.

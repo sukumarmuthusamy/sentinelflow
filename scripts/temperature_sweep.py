@@ -15,7 +15,7 @@ from pathlib import Path
 from app.agents.contracts import ChangeImpact
 from app.agents.mcp_tools import context_json, mcp_change_analyst_context
 from app.agents.prompts import PROMPT_VERSION
-from app.agents.prompts import v2 as prompts
+from app.agents.prompts import v3 as prompts
 from app.core.settings import get_settings
 from app.graph.state import AnalysisRequest
 from app.mcp_client import SentinelFlowMcpAdapter
@@ -62,6 +62,30 @@ class SweepArm:
     attempts: int = 0
     schema_valid: int = 0
     outcomes: list[str] = field(default_factory=list)
+
+    @property
+    def completed(self) -> int:
+        """Calls where the model actually answered (valid or schema-invalid)."""
+        return sum(
+            outcome in {AttemptOutcome.OK.value, AttemptOutcome.INVALID.value}
+            for outcome in self.outcomes
+        )
+
+    @property
+    def schema_valid_rate(self) -> float | None:
+        """Valid / completed. Provider and quota failures say nothing about the model's
+        output at this temperature, so they are excluded; None when nothing completed."""
+        return self.schema_valid / self.completed if self.completed else None
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "schema_valid_rate": self.schema_valid_rate,
+            "schema_valid_count": self.schema_valid,
+            "completed_responses": self.completed,
+            "api_or_quota_failures": self.attempts - self.completed,
+            "attempts": self.attempts,
+            "outcomes": self.outcomes,
+        }
 
 
 @dataclass
@@ -249,18 +273,19 @@ async def run_sweep(
     return arms, meta
 
 
-def _choose_temperature(arms: dict[float, SweepArm]) -> float | None:
-    """Pick highest schema-valid rate; tie-break toward lower temperature."""
-    if not arms:
+def choose_temperature(arms: dict[float, SweepArm]) -> float | None:
+    """Pick the highest schema-valid rate over completed responses.
+
+    Ties break toward the lower temperature. Returns None when no arm completed a
+    single response or no arm produced a valid one: an empty measurement is not a
+    choice. Every arm must have completed at least one response to be comparable.
+    """
+    measured = {temp: arm.schema_valid_rate for temp, arm in arms.items()}
+    if not measured or any(rate is None for rate in measured.values()):
         return None
-    ranked = sorted(
-        arms.items(),
-        key=lambda item: (-item[1].schema_valid / max(item[1].attempts, 1), item[0]),
-    )
-    best_rate = ranked[0][1].schema_valid / max(ranked[0][1].attempts, 1)
-    if best_rate <= 0:
-        return None
-    return ranked[0][0]
+    rates = {temp: rate for temp, rate in measured.items() if rate is not None}
+    best = min(rates, key=lambda temp: (-rates[temp], temp))
+    return best if rates[best] > 0 else None
 
 
 def main() -> None:
@@ -320,19 +345,11 @@ def main() -> None:
             sys.exit(2)
         raise
 
-    chosen = _choose_temperature(arms)
+    chosen = choose_temperature(arms)
     payload: dict[str, object] = {
         "meta": meta,
         "recommended_agent_llm_temperature": chosen,
-        "arms": {
-            str(temp): {
-                "schema_valid_rate": arm.schema_valid / max(arm.attempts, 1),
-                "schema_valid_count": arm.schema_valid,
-                "attempts": arm.attempts,
-                "outcomes": arm.outcomes,
-            }
-            for temp, arm in arms.items()
-        },
+        "arms": {str(temp): arm.summary() for temp, arm in arms.items()},
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")

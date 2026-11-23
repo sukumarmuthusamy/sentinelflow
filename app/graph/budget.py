@@ -25,7 +25,6 @@ class AnalysisBudget:
     llm_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
-    active_parallel: int = 0
 
     @classmethod
     def from_settings(cls, settings: Settings | None = None) -> AnalysisBudget:
@@ -56,21 +55,6 @@ class AnalysisBudget:
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
 
-    @dataclass
-    class ParallelSlot:
-        budget: AnalysisBudget
-
-        def __enter__(self) -> None:
-            if self.budget.active_parallel >= self.budget.max_parallel_agents:
-                raise BudgetExhaustedError("max_parallel_agents exceeded")
-            self.budget.active_parallel += 1
-
-        def __exit__(self, *_exc: object) -> None:
-            self.budget.active_parallel = max(0, self.budget.active_parallel - 1)
-
-    def parallel_slot(self) -> ParallelSlot:
-        return AnalysisBudget.ParallelSlot(self)
-
 
 @dataclass
 class TraceAccumulator:
@@ -83,6 +67,7 @@ class TraceAccumulator:
     input_tokens: int = 0
     output_tokens: int = 0
     citations_rejected: int = 0
+    repair_count: int = 0
 
     def bump_llm(self, *, input_tokens: int = 0, output_tokens: int = 0) -> None:
         self.llm_calls += 1

@@ -2,53 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from pathlib import Path
-from typing import Any
-
 import pytest
 from app.agents.contracts import ChangeImpact, RiskHypothesis, VerificationReport
-from app.graph.state import AnalysisRequest
 from app.model_gateway.llm import StaticStructuredLLM
-from tests.contract.conftest import mcp_session
-from tests.graph.conftest import static_llm_responses
-
-RunGraph = Callable[..., Awaitable[dict[str, Any]]]
-
-
-@pytest.fixture
-def run_graph(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, audit_log_path: Path) -> RunGraph:
-    _ = audit_log_path
-
-    async def _run(
-        change_id: str,
-        llm: StaticStructuredLLM,
-        *,
-        env: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        from app.core.settings import get_settings
-        from app.graph.runner import run_analysis
-
-        monkeypatch.setenv("GRAPH_CHECKPOINT_PATH", str(tmp_path / f"{change_id}.sqlite"))
-        for key, value in (env or {}).items():
-            monkeypatch.setenv(key, value)
-        get_settings.cache_clear()
-        settings = get_settings()
-        request = AnalysisRequest(change_id=change_id, domain_pack_id="healthcare-claims")
-        try:
-            async with mcp_session() as mcp:
-                return await run_analysis(
-                    request,
-                    mcp=mcp,
-                    llm=llm,
-                    thread_id=f"t-{change_id}-{tmp_path.name}",
-                    settings=settings,
-                    enable_retrieval=False,
-                )
-        finally:
-            get_settings.cache_clear()
-
-    return _run
+from tests.graph.conftest import RunGraph, static_llm_responses
 
 
 @pytest.mark.asyncio
@@ -128,3 +85,14 @@ async def test_clean_doc_change_passes_with_nothing_to_verify(run_graph: RunGrap
     assert state["risk_assessment"]["decision"] == "PASS"
     assert state["verification_metrics"]["evidence_coverage"] is None
     assert state["rejected_evidence_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_missing_retrieval_never_passes_silently(run_graph: RunGraph) -> None:
+    llm = StaticStructuredLLM(static_llm_responses())
+    state = await run_graph("CHG-H001", llm, retriever=None)
+    assert state["degraded_to_review"] is True
+    assert state["risk_assessment"]["decision"] == "REVIEW"
+    assert any("retrieval service unavailable" in error for error in state["errors"])
+    # Degraded after fan-out: the verifier is skipped, not run on missing evidence.
+    assert "VerificationReport" not in llm.calls

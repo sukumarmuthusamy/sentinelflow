@@ -14,6 +14,25 @@ from app.deterministic.models import (
 from app.deterministic.risk_engine import score_to_decision
 from app.graph.state import ReleaseDecision
 
+_DECISION_RANK: dict[ReleaseDecision, int] = {
+    ReleaseDecision.PASS: 0,
+    ReleaseDecision.REVIEW: 1,
+    ReleaseDecision.BLOCK: 2,
+}
+
+
+def decision_rank(decision: ReleaseDecision) -> int:
+    """Safety precedence: PASS < REVIEW < BLOCK."""
+    return _DECISION_RANK[decision]
+
+
+def strictest_decision(*decisions: ReleaseDecision) -> ReleaseDecision:
+    """The most restrictive of the given decisions (a gate can only escalate)."""
+    if not decisions:
+        msg = "strictest_decision requires at least one decision"
+        raise ValueError(msg)
+    return max(decisions, key=decision_rank)
+
 
 class PolicyEvaluationContext(BaseModel):
     """Inputs required to evaluate policy overrides."""
@@ -95,22 +114,34 @@ def apply_policy_gate(
         ),
     )
 
-    for override in domain_pack.policy.overrides:
-        if evaluate_override(override, context=context, domain_pack=domain_pack):
-            return PolicyGateResult(
-                decision=ReleaseDecision(override.outcome),
-                risk_score=risk.risk_score,
-                override_applied=override.id,
-                override_condition=override.condition,
-                score_decision=score_decision,
-                norms=risk.norms,
-            )
-
+    # Every override is evaluated; the strictest outcome wins. Equal-severity ties
+    # break by override id, so the result never depends on policy.yaml ordering.
+    matched = sorted(
+        (
+            override
+            for override in domain_pack.policy.overrides
+            if evaluate_override(override, context=context, domain_pack=domain_pack)
+        ),
+        key=lambda override: (-decision_rank(ReleaseDecision(override.outcome)), override.id),
+    )
+    decision = strictest_decision(
+        score_decision,
+        *(ReleaseDecision(override.outcome) for override in matched),
+    )
+    deciding = next(
+        (
+            override
+            for override in matched
+            if decision_rank(ReleaseDecision(override.outcome)) >= decision_rank(score_decision)
+        ),
+        None,
+    )
     return PolicyGateResult(
-        decision=score_decision,
+        decision=decision,
         risk_score=risk.risk_score,
-        override_applied=None,
-        override_condition=None,
+        override_applied=deciding.id if deciding is not None else None,
+        override_condition=deciding.condition if deciding is not None else None,
+        overrides_matched=[override.id for override in matched],
         score_decision=score_decision,
         norms=risk.norms,
     )

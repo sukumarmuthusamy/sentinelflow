@@ -150,5 +150,7 @@ class PolicyGateResult(BaseModel):
     risk_score: int = Field(ge=0, le=100)
     override_applied: str | None = None
     override_condition: str | None = None
+    # Every override whose condition held, strictest first (audit trail).
+    overrides_matched: list[str] = Field(default_factory=list)
     score_decision: ReleaseDecision
     norms: NormBreakdown

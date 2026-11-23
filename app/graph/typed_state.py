@@ -8,6 +8,7 @@ from typing import Annotated, Any, NotRequired, TypedDict
 from langgraph.managed import RemainingSteps
 from langgraph.types import Overwrite
 
+from app.graph.evidence_context import merge_unique_chunks
 from app.graph.plan_validation import AGENT_SORT_KEYS
 
 
@@ -53,7 +54,10 @@ class GraphState(TypedDict):
     verification: dict[str, Any] | None
     risk_assessment: dict[str, Any] | None
     retrieved_evidence_ids: Annotated[list[str], merge_unique_strings]
-    retrieved_chunks: dict[str, Any] | None
+    # Chunk text from every retrieving node, deduplicated by evidence ID.
+    retrieved_chunks: Annotated[list[dict[str, Any]], merge_unique_chunks]
+    # Retrieved chunks withheld from all prompts as instruction-like (untrusted).
+    injection_evidence_ids: Annotated[list[str], merge_unique_strings]
     evidence_gaps: Annotated[list[str], merge_unique_strings]
     repair_count: int
     approval_status: str

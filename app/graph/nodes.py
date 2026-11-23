@@ -10,12 +10,12 @@ from typing import Any, Literal
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Overwrite, Send, interrupt
 from mcp_server.sentinelflow_context.models import RecordGateDecisionResponse
+from pydantic import ValidationError
 
 from app.agents.contracts import (
     ChangeImpact,
     EvidenceBundle,
     SecurityFindings,
-    VerificationReport,
 )
 from app.agents.execute import (
     run_change_analyst,
@@ -25,15 +25,18 @@ from app.agents.execute import (
     run_test_strategist,
     run_triage_planner,
 )
+from app.agents.observable import agent_signal_view, runtime_signals
 from app.agents.queries import evidence_queries_from_signals, security_query_from_signals
 from app.core.domain_pack import load_domain_pack
 from app.deterministic.evaluate import build_signals_from_fixture, load_change_fixture_manifest
 from app.deterministic.evaluate import resolve_fixture_directory as resolve_fixture
 from app.deterministic.models import DeterministicSignals
-from app.deterministic.policy_gate import apply_policy_gate
+from app.deterministic.policy_gate import apply_policy_gate, strictest_decision
 from app.deterministic.risk_engine import compute_risk_score
 from app.graph.budget import BudgetExhaustedError
 from app.graph.context import AnalysisGraphContext
+from app.graph.evidence_context import build_verifier_evidence, chunk_records
+from app.graph.evidence_ids import evidence_id
 from app.graph.plan_validation import (
     default_plan_for_pack,
     parallel_agents_from_plan,
@@ -57,11 +60,25 @@ from app.graph.verification import (
     compute_verification_metrics,
     material_assertions,
 )
+from app.mcp_client.errors import McpProtocolError, McpToolError
 from app.mcp_client.port import McpClientPort
 from app.model_gateway.llm import StructuredOutputError
 
 # Degrade to REVIEW when this few supersteps remain (repair loop plus graph tail).
 MIN_REMAINING_STEPS = 6
+
+# Failures inside one agent that make its output unusable but say nothing about the
+# change itself. They degrade the run to REVIEW (never weakening BLOCK) instead of
+# aborting the superstep. Provider quota/auth errors are deliberately not here: an
+# exhausted API key is an infrastructure stop, not an analysis outcome.
+AGENT_FAILURES: tuple[type[Exception], ...] = (
+    StructuredOutputError,
+    McpToolError,
+    McpProtocolError,
+    ValidationError,
+    ConnectionError,
+    TimeoutError,
+)
 
 
 def _ctx(config: RunnableConfig) -> AnalysisGraphContext:
@@ -103,6 +120,7 @@ def _trace_update(ctx: AnalysisGraphContext) -> dict[str, Any]:
             input_tokens=ctx.trace.input_tokens,
             output_tokens=ctx.trace.output_tokens,
             citations_rejected=ctx.trace.citations_rejected,
+            repair_count=ctx.trace.repair_count,
         ).model_dump(mode="json"),
     }
 
@@ -133,11 +151,15 @@ def deterministic_signal_layer(state: GraphState, config: RunnableConfig) -> dic
         domains_root=ctx.domain_pack.root.parent,
     )
     manifest = load_change_fixture_manifest(fixture_dir)
-    signals = build_signals_from_fixture(
-        fixture_dir,
-        manifest,
-        ctx.domain_pack,
-        fixture_only=True,
+    # Manifest verification stubs exist for the M1 fixture tests; at runtime the
+    # graph measures coverage itself, so they are reset before anything reads them.
+    signals = runtime_signals(
+        build_signals_from_fixture(
+            fixture_dir,
+            manifest,
+            ctx.domain_pack,
+            fixture_only=True,
+        ),
     )
     return {
         "deterministic_signals": signals.model_dump(mode="json"),
@@ -196,10 +218,23 @@ async def triage_planner_node(state: GraphState, config: RunnableConfig) -> dict
             **_trace_update(ctx),
         }
     plan = validate_analysis_plan(proposed, ctx.domain_pack)
+    try:
+        # If triage itself spent the budget, stop here rather than fan out agents
+        # that would each run MCP tools and retrieval only to fail at their LLM call.
+        ctx.budget.check_llm_call()
+    except BudgetExhaustedError as exc:
+        return {"plan": plan.model_dump(mode="json"), **_degraded(exc.reason), **_trace_update(ctx)}
     return {"plan": plan.model_dump(mode="json"), **_trace_update(ctx)}
 
 
-def plan_fan_out(state: GraphState) -> list[Send]:
+def gate_router(state: GraphState) -> Literal["continue", "degrade_review"]:
+    """After a guard: stop spending LLM calls once the run is already degraded."""
+    return "degrade_review" if state.get("degraded_to_review") else "continue"
+
+
+def plan_fan_out(state: GraphState) -> list[Send] | str:
+    if state.get("degraded_to_review"):
+        return "degrade_review"
     plan = AnalysisPlan.model_validate(state["plan"])
     sends: list[Send] = []
     for agent in parallel_agents_from_plan(plan):
@@ -226,13 +261,17 @@ async def run_parallel_agent(state: GraphState, config: RunnableConfig) -> dict[
     signals = _signals(state)
     updates: dict[str, Any] = {}
     status = "ok"
-    with ctx.budget.parallel_slot():
+    # Branches beyond max_parallel_agents wait for a slot rather than failing.
+    async with ctx.parallel_limit:
         ctx.trace.agent_steps += 1
         try:
             updates.update(await _dispatch_agent(agent, ctx, request, signals))
         except BudgetExhaustedError as exc:
             status = "budget_exhausted"
             updates.update(_degraded(f"{agent}: {exc.reason}"))
+        except AGENT_FAILURES as exc:
+            status = "failed"
+            updates.update(_degraded(f"{agent} failed: {type(exc).__name__}: {str(exc)[:200]}"))
 
     updates["parallel_completions"] = [completion_for_agent(agent, status=status)]
     return updates
@@ -253,12 +292,13 @@ async def _dispatch_agent(
             model=ctx.agent_model,
             temperature=ctx.agent_temperature,
             request=request,
-            signals=signals.model_dump(mode="json") if signals else {},
+            signals=agent_signal_view(signals),
         )
         return {"change_impact": impact.model_dump(mode="json")}
     if agent == "evidence_investigator":
         if ctx.retrieval is None:
-            return {"errors": ["retrieval service unavailable"]}
+            # No evidence can be gathered: a human must look, never a silent PASS.
+            return _degraded("evidence_investigator: retrieval service unavailable")
         # Runs in parallel with the Change Analyst, so it cannot see hypotheses;
         # queries come from this change's deterministic signals instead.
         queries = evidence_queries_from_signals(signals, fallback=request.objective)
@@ -274,7 +314,8 @@ async def _dispatch_agent(
         return {
             "evidence": bundle.model_dump(mode="json"),
             "retrieved_evidence_ids": sorted(outcome.allowed_ids),
-            "retrieved_chunks": [chunk.model_dump(mode="json") for chunk in outcome.chunks],
+            "retrieved_chunks": chunk_records(outcome.chunks, source="evidence_investigator"),
+            "injection_evidence_ids": outcome.injection_ids,
             "rejected_evidence_ids": outcome.rejected_ids,
         }
     if agent == "test_strategist":
@@ -300,11 +341,12 @@ async def _dispatch_agent(
             request=request,
             security_query=security_query_from_signals(signals, fallback=request.objective),
         )
-        # The verifier validates against retrieved_evidence_ids, so the auditor's
-        # evidence must land there too or its valid citations get stripped.
+        # The auditor's chunks join the shared evidence so the verifier can read them.
         return {
             "security_findings": findings.model_dump(mode="json"),
             "retrieved_evidence_ids": sorted(outcome.allowed_ids),
+            "retrieved_chunks": chunk_records(outcome.chunks, source="security_auditor"),
+            "injection_evidence_ids": outcome.injection_ids,
             "rejected_evidence_ids": outcome.rejected_ids,
         }
     return {"errors": [f"unknown parallel agent: {agent}"]}
@@ -319,6 +361,21 @@ async def merge_findings(state: GraphState, config: RunnableConfig) -> dict[str,
     return {"parallel_completions": completions, **_trace_update(ctx)}
 
 
+def _priority_evidence_ids(state: GraphState) -> set[str]:
+    """Chunks a specialist actually cited are shown to the verifier first."""
+    ids: set[str] = set()
+    evidence = state.get("evidence") or {}
+    for item in evidence.get("items") or []:
+        citation = item.get("citation") or {}
+        ids.add(
+            evidence_id(str(citation.get("document_id", "")), str(citation.get("section_id", "")))
+        )
+    security = state.get("security_findings") or {}
+    for finding in security.get("findings") or []:
+        ids.update(str(eid) for eid in finding.get("evidence_ids") or [])
+    return ids
+
+
 async def evidence_verifier_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     ctx = _ctx(config)
     plan = AnalysisPlan.model_validate(state["plan"])
@@ -331,34 +388,60 @@ async def evidence_verifier_node(state: GraphState, config: RunnableConfig) -> d
         ChangeImpact.model_validate(impact_raw) if impact_raw else None,
         SecurityFindings.model_validate(security_raw) if security_raw else None,
     )
-    allowed = set(state.get("retrieved_evidence_ids") or [])
+    signals = _signals(state)
+    evidence = build_verifier_evidence(
+        list(state.get("retrieved_chunks") or []),
+        priority_ids=_priority_evidence_ids(state),
+    )
+    if not evidence.shown:
+        # Nothing to verify against: every assertion is unsupported, with no LLM call.
+        metrics = compute_verification_metrics(assertions, None, signals=signals)
+        errors = ["evidence_verifier: no retrieved evidence; assertions unsupported"]
+        return {
+            "verification_metrics": metrics.model_dump(mode="json"),
+            "evidence_gaps": list(metrics.unsupported_ids),
+            "errors": errors if assertions else [],
+            **_trace_update(ctx),
+        }
+    # The Investigator's stance labels are left out on purpose: the verifier reads the
+    # source text, not another agent's reading of it.
     specialist_payload = {
         "change_impact": impact_raw,
-        "evidence": state.get("evidence"),
         "regression_plan": state.get("regression_plan"),
         "security_findings": security_raw,
     }
-    report: VerificationReport
     try:
-        report, rejected = await run_evidence_verifier(
+        outcome = await run_evidence_verifier(
             ctx.llm,
             budget=ctx.budget,
             trace=ctx.trace,
             model=ctx.agent_model,
             temperature=ctx.agent_temperature,
-            allowed_ids=allowed,
             assertions=assertions,
+            evidence=evidence,
             specialist_payload=specialist_payload,
         )
     except BudgetExhaustedError as exc:
         return {**_degraded(f"evidence_verifier: {exc.reason}"), **_trace_update(ctx)}
+    except AGENT_FAILURES as exc:
+        reason = f"evidence_verifier failed: {type(exc).__name__}: {str(exc)[:200]}"
+        return {**_degraded(reason), **_trace_update(ctx)}
 
-    metrics = compute_verification_metrics(assertions, report, signals=_signals(state))
+    # Split rejected citations: never retrieved (invented) vs retrieved but not shown.
+    retrieved = set(state.get("retrieved_evidence_ids") or [])
+    invented = [eid for eid in outcome.rejected_ids if eid not in retrieved]
+    withheld = [f"{eid}: cited but not shown" for eid in outcome.rejected_ids if eid in retrieved]
+    metrics = compute_verification_metrics(
+        assertions,
+        outcome.report,
+        signals=signals,
+        grounding_rejections=[*outcome.grounding_rejections, *withheld],
+    )
     return {
-        "verification": report.model_dump(mode="json"),
+        "verification": outcome.report.model_dump(mode="json"),
         "verification_metrics": metrics.model_dump(mode="json"),
         "evidence_gaps": list(metrics.unsupported_ids),
-        "rejected_evidence_ids": rejected,
+        "rejected_evidence_ids": invented,
         **_trace_update(ctx),
     }
 
@@ -401,11 +484,13 @@ async def focused_retrieval_repair(state: GraphState, config: RunnableConfig) ->
     ctx = _ctx(config)
     request = _request(state)
     repair_count = int(state.get("repair_count") or 0) + 1
+    ctx.trace.repair_count = repair_count
     if ctx.retrieval is None:
         return {
             "repair_count": repair_count,
             "evidence_gaps": Overwrite([]),
-            "errors": ["retrieval unavailable during repair"],
+            **_degraded("repair: retrieval unavailable"),
+            **_trace_update(ctx),
         }
 
     bundle_raw = state.get("evidence")
@@ -428,6 +513,13 @@ async def focused_retrieval_repair(state: GraphState, config: RunnableConfig) ->
             **_degraded(f"repair: {exc.reason}"),
             **_trace_update(ctx),
         }
+    except AGENT_FAILURES as exc:
+        return {
+            "repair_count": repair_count,
+            "evidence_gaps": Overwrite([]),
+            **_degraded(f"repair failed: {type(exc).__name__}: {str(exc)[:200]}"),
+            **_trace_update(ctx),
+        }
     # Repair exists to find NEW evidence: cite against what this repair retrieved,
     # then union with the earlier set (an intersection would discard new evidence).
     existing_ids = set(state.get("retrieved_evidence_ids") or [])
@@ -437,12 +529,12 @@ async def focused_retrieval_repair(state: GraphState, config: RunnableConfig) ->
             "retrieval_queries": prior.retrieval_queries + repaired.retrieval_queries,
         },
     )
-    prior_chunks = list(state.get("retrieved_chunks") or [])
     return {
         "evidence": merged.model_dump(mode="json"),
         "retrieved_evidence_ids": sorted(existing_ids | outcome.allowed_ids),
-        "retrieved_chunks": prior_chunks
-        + [chunk.model_dump(mode="json") for chunk in outcome.chunks],
+        # The reducer unions these with the chunks already in state.
+        "retrieved_chunks": chunk_records(outcome.chunks, source="repair"),
+        "injection_evidence_ids": outcome.injection_ids,
         "rejected_evidence_ids": outcome.rejected_ids,
         "repair_count": repair_count,
         "evidence_gaps": Overwrite([]),
@@ -454,7 +546,17 @@ def risk_engine_node(state: GraphState, config: RunnableConfig) -> dict[str, Any
     ctx = _ctx(config)
     signals = _signals(state)
     if signals is None:
-        return {"errors": ["missing deterministic signals"]}
+        # Never leave the report without a decision; with no signals a human decides.
+        assessment = RiskAssessment(
+            risk_score=100,
+            decision=ReleaseDecision.REVIEW,
+            confidence=0.0,
+            override_applied="missing_deterministic_signals",
+        )
+        return {
+            "risk_assessment": assessment.model_dump(mode="json"),
+            **_degraded("risk_engine: missing deterministic signals"),
+        }
 
     metrics = _metrics(state)
     repair_count = int(state.get("repair_count") or 0)
@@ -469,11 +571,25 @@ def risk_engine_node(state: GraphState, config: RunnableConfig) -> dict[str, Any
     updated = signals.model_copy(update=update)
     risk = compute_risk_score(updated, ctx.domain_pack)
     gate = apply_policy_gate(updated, ctx.domain_pack, risk)
+    decision = ReleaseDecision(gate.decision)
+    override = gate.override_applied
+    matched = list(gate.overrides_matched)
+    # Suspected injection (screened chunks or the verifier's report) is a REVIEW
+    # floor: it escalates PASS, never decides BLOCK, and never weakens a BLOCK.
+    injection = bool(state.get("injection_evidence_ids")) or (
+        metrics is not None and metrics.injection_flagged
+    )
+    if injection:
+        matched.append("injection-suspected")
+        floored = strictest_decision(decision, ReleaseDecision.REVIEW)
+        if floored != decision:
+            decision, override = floored, "injection-suspected"
     assessment = RiskAssessment(
         risk_score=gate.risk_score,
-        decision=ReleaseDecision(gate.decision),
+        decision=decision,
         confidence=max(0.0, 1.0 - unsupported_rate),
-        override_applied=gate.override_applied,
+        override_applied=override,
+        overrides_matched=matched,
         component_scores=risk.weighted_components,
     )
     return {
@@ -484,7 +600,7 @@ def risk_engine_node(state: GraphState, config: RunnableConfig) -> dict[str, Any
 
 def _degraded_decision(computed: ReleaseDecision) -> ReleaseDecision:
     """Degradation means "a human must look", so it never weakens a deterministic BLOCK."""
-    return ReleaseDecision.BLOCK if computed == ReleaseDecision.BLOCK else ReleaseDecision.REVIEW
+    return strictest_decision(computed, ReleaseDecision.REVIEW)
 
 
 def degrade_review_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
@@ -515,6 +631,7 @@ def degrade_review_node(state: GraphState, config: RunnableConfig) -> dict[str, 
         decision=_degraded_decision(ReleaseDecision(gate.decision)),
         confidence=0.5,
         override_applied=gate.override_applied or "budget_or_recursion",
+        overrides_matched=list(gate.overrides_matched),
         component_scores=risk.weighted_components,
     )
     return {"risk_assessment": assessment.model_dump(mode="json"), "degraded_to_review": True}

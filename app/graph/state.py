@@ -66,6 +66,8 @@ class RiskAssessment(BaseModel):
     decision: ReleaseDecision
     confidence: float = Field(ge=0.0, le=1.0)
     override_applied: str | None = None
+    # Every policy condition that held, strictest first, for the audit trail.
+    overrides_matched: list[str] = Field(default_factory=list)
     component_scores: dict[str, float] = Field(default_factory=dict)
 
 

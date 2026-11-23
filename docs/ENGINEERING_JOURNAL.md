@@ -158,6 +158,8 @@ Tests: `tests/unit/test_evidence_queries.py`, `tests/unit/test_budget.py`, `test
 
 **Root cause.** The resume path restored graph state but not the runtime counters that live outside it. The H001 flip is not a bug: it is sampling variance on a change whose coverage sits exactly at the policy floor, made coarse by small assertion counts.
 
+> **Correction (M4 hardening, next entry).** The H001 diagnosis above was incomplete. Checkpoint inspection showed the fixture manifest's synthetic `evidence_coverage: 0.9` reaching the Change Analyst's prompt in both runs, which then emitted a "10% of evidence is uncovered" hypothesis that the verifier contradicted. Fixture labels leaking into agent input was a driver of the flip, not only sampling variance.
+
 **Decision.**
 
 - `runner.restore_counters` seeds the trace and budget from the checkpointed `trace_metrics` before resuming. `tests/graph/test_interrupt_resume.py` now asserts the trace survives resume; it failed (`0 == 5`) before the fix. Run 1's results are kept as `evals/graph/m4_sample_results_run1.json`, with its CHG-E002 trace known-wrong; run 2 (`m4_sample_results.json`) is after the fix.
@@ -165,3 +167,47 @@ Tests: `tests/unit/test_evidence_queries.py`, `tests/unit/test_budget.py`, `test
 - Temperature sweep on Nemotron, Change Analyst schema, three repeats each: 0.0, 0.2 and 1.0 were all 3/3 schema-valid (`evals/graph/temperature_sweep_nemotron.json`). Schema validity does not discriminate on this model, so the script's tie-break pick of 0.0 carries no information. `AGENT_LLM_TEMPERATURE` stays at **0.2**, the value under which both full samples met the citation criteria. Separating temperatures needs a decision-stability metric over repeated full trajectories, which is M6 work.
 - The gate is unchanged. Whether H001's floor-straddling coverage should be handled by more assertions, a calibrated floor, or repeated sampling is an M6 calibration question; widening the floor to make this sample pass would be fitting the policy to one run.
 - Not measured: `gemini-3.8-flash`, the planned primary model, which was out of daily quota for the whole session. The default `AGENT_LLM_MODEL` is unchanged; the OpenRouter model is passed per run with `--agent-model`.
+
+---
+
+## M4 hardening: BLOCK could be downgraded, the verifier never read its evidence, and fixture labels reached agents
+
+**What looked wrong.** A review of the M4 branch, done before merging, found three gate-integrity defects. None of them showed up in the ten live trajectories, because those scenarios happened to avoid the code paths involved.
+
+1. CHG-E003 (a high-severity dependency vulnerability, expected BLOCK) returned REVIEW once evidence coverage fell below the floor.
+2. The Evidence Verifier's checkpointed notes echoed the Evidence Investigator's labels ("q0 evidence carries a support stance") instead of quoting documents. It also marked hypotheses `supported` while citing chunks that do not mention them.
+3. Change Analyst hypotheses quoted numbers that exist only in fixture manifests ("10% lacks coverage" from `evidence_coverage: 0.9`).
+
+**Investigation.**
+
+- *Gate.* `apply_policy_gate` returned on the first matching override in `policy.yaml` order. Both packs list `weak-evidence` and `unsupported-critical-claim` (REVIEW) above `dependency-vuln-ceiling` (BLOCK). Offline, CHG-E003 goes from BLOCK to REVIEW at coverage 0.5, and to REVIEW again with an unsupported critical assertion after repair. A score above `review_max` (for example 86) with weak evidence also returned REVIEW. In the live sample every BLOCK came from `critical-contract-break` or `secret-exposure`, which are listed first, so no committed result was affected.
+- *Verifier input.* `evidence_verifier_node` sent the specialists' structured outputs and the list of allowed IDs, never chunk text. The Security Auditor's chunks were not stored at all. `retrieved_chunks` was typed as a single dict with no reducer, so a second parallel writer would have raised a concurrent-update error. Citation validity was 100% only in the sense that the IDs existed.
+- *Leakage.* `build_signals_from_fixture` copies three manifest fields into the runtime signals: `evidence_coverage`, `repair_attempted` and `critical_claims_unsupported`. They are synthetic stand-ins that the M1 deterministic tests need. The fields reached the Change Analyst's prompt. They also reached scoring: when no verification metrics existed, the risk engine kept the stub coverage, and `compute_norms` turned the stub `critical_claims_unsupported=True` into an unsupported rate of 1.0. Separately, `get_change_package` returned the manifest `description` and `category`, which are evaluator notes that state the answer ("Critical claim remains unsupported after the single repair attempt").
+
+**Root cause.** Three separate gaps. Gate precedence depended on file order. The verifier was handed interpretations instead of sources. And the fixture manifest serves both as runtime input and as the answer key, with nothing separating the two.
+
+**Decision.**
+
+- **Gate.** Every override is evaluated. The final decision is the strictest of the score decision and all matched outcomes (PASS < REVIEW < BLOCK). Equal-severity ties break by override id, so permuting `policy.yaml` cannot change the result (a test checks all 120 orderings). `override_applied` names the override that set the decision. The new `overrides_matched` field keeps every reason for the audit trail. `policy.yaml` is not reordered; the fix does not depend on order. Degradation and the injection floor use the same `strictest_decision` helper.
+- **Verifier grounding.** Chunks from the Investigator, the Security Auditor and repair merge into `retrieved_chunks`, deduplicated by evidence ID and sorted, so branch completion order does not matter. The verifier gets a bounded view: up to 40 chunks, 1,500 characters each, 40,000 in total, with specialist-cited chunks first. It can cite only chunks it was shown. It does not get the Investigator's stance labels. A `supported` judgment survives only if its new `supporting_quote` passes four checks in code (`ground_report`):
+  - it is at least 20 characters;
+  - it appears verbatim (case and whitespace normalized) in a cited, shown chunk;
+  - it shares a salient term with the assertion;
+  - its negation polarity matches the assertion's.
+
+  These checks do not prove semantic support. They stop a valid ID, an off-topic excerpt or a contradicting excerpt from counting as support on the model's say-so. Failures go toward REVIEW, the conservative direction, and the false-negative rate is an M6 measurement. With no retrieved evidence, the verifier is not called and every assertion counts as unsupported. Security findings whose citations are all invalid are now kept with no evidence, so they count as unsupported (and, if high severity, as critical), instead of disappearing.
+- **Untrusted content.** Prompts are now `v3`. Every system prompt states that tool output and retrieved documents are data, and retrieved text arrives in a field named `untrusted_retrieved_documents`. Retrieved chunks pass a deterministic screen for instruction-like text (`app/graph/injection.py`). Matching chunks are withheld from every prompt and are not citable. Any hit, and any injection report from the verifier, is a REVIEW floor: it can escalate a PASS but cannot decide BLOCK or weaken one. This is a coarse first line of defence; the adversarial suite is M7.
+- **Leakage.** At runtime, `deterministic_signal_layer` resets the three verification fields (`runtime_signals`); the graph measures them itself. Agents see signals with those fields removed and a change package restricted to observable fields: ID, source, pack, primary service, changed files, origin nodes. M1 fixture evaluation is unchanged and still uses the stubs; that is what they are for.
+- **Reliability, in the same pass.**
+  - Degraded runs skip later LLM nodes: after the step and budget guards, at fan-out, after fan-in, and after repair.
+  - Concurrent agents are limited by a semaphore instead of raising.
+  - Structured-output, MCP and validation failures inside an agent, the verifier or repair degrade to REVIEW without weakening a BLOCK. Provider quota and auth errors still stop the run; they are not analysis outcomes.
+  - Missing retrieval degrades instead of silently passing.
+  - The risk engine always returns an assessment.
+  - `run_tests` receives the allowlisted required test IDs and is always a dry run.
+  - `trace_metrics.repair_count` is now populated.
+  - CHG-E001's manifest gains its missing `changed_files`.
+  - The temperature sweep computes validity over completed responses, so a 503 is no longer counted as a schema failure. Re-scored this way, the earlier proxy sweep favours 0.0 (2/2) over 0.2 (3/3) only by tie-break. `AGENT_LLM_TEMPERATURE` stays at 0.2 as a provisional value until the primary model is measured.
+- **Earlier live results** (`evals/graph/m4_sample_results*.json`) are kept unchanged. They were produced before these fixes, with fixture labels leaking into agent prompts and an ungrounded verifier, so they show that the graph runs end to end. They are not evidence of decision quality.
+
+Tests: `tests/unit/test_policy_gate.py`, `tests/unit/test_grounding.py`, `tests/unit/test_evidence_context.py`, `tests/unit/test_temperature_sweep_metrics.py`, `tests/graph/test_evidence_grounding.py`, `tests/graph/test_no_label_leakage.py`, `tests/graph/test_degradation_paths.py`, `tests/graph/test_interrupt_resume.py`, `tests/graph/test_test_strategist_context.py`.

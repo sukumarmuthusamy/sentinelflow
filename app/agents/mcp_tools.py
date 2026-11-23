@@ -14,6 +14,7 @@ from mcp_server.sentinelflow_context.models import (
     SecurityScanToolResponse,
 )
 
+from app.agents.observable import observable_change_package
 from app.mcp_client.port import McpClientPort
 
 
@@ -40,10 +41,22 @@ async def mcp_change_analyst_context(
         response_model=ContractDiffToolResponse,
     )
     return {
-        "change_package": package.model_dump(),
+        # Labels (description, category, fixture path) never reach the agent.
+        "change_package": observable_change_package(package),
         "dependency_graph": graph.model_dump(),
         "contract_diff": contracts.model_dump(),
     }
+
+
+MAX_RUN_TEST_IDS = 64
+
+
+def runnable_test_ids(inventory: ChangeTestInventory) -> list[str]:
+    """Required tests that the inventory also lists as available, in stable order."""
+    available = set(inventory.available_tests)
+    return [test_id for test_id in inventory.required_tests if test_id in available][
+        :MAX_RUN_TEST_IDS
+    ]
 
 
 async def mcp_test_strategist_context(
@@ -59,12 +72,16 @@ async def mcp_test_strategist_context(
         response_model=ChangeTestInventory,
     )
     run_result: RunTestsResponse | None = None
-    if execute_tests:
+    # Only the required tests the inventory allowlists; always a dry run (live
+    # sandboxed execution is M7). No eligible tests means no run_tests call at all.
+    test_ids = runnable_test_ids(inventory)
+    if execute_tests and test_ids:
         run_result = await mcp.call_tool_typed(
             "run_tests",
             {
                 "change_id": change_id,
                 "domain_pack_id": domain_pack_id,
+                "test_ids": test_ids,
                 "dry_run": True,
             },
             response_model=RunTestsResponse,

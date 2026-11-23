@@ -50,14 +50,16 @@ def filter_security_findings(
     findings: list[SecurityFinding],
     allowed_ids: set[str],
 ) -> tuple[list[SecurityFinding], list[str]]:
+    """Strip citations absent from the retrieved set, but keep every finding.
+
+    A finding with only invalid citations stays, with no evidence: it then counts as
+    an unsupported (possibly critical) assertion instead of silently vanishing.
+    """
     kept: list[SecurityFinding] = []
     rejected: list[str] = []
     for finding in findings:
         valid_ids = [eid for eid in finding.evidence_ids if eid in allowed_ids]
-        invalid = [eid for eid in finding.evidence_ids if eid not in allowed_ids]
-        rejected.extend(invalid)
-        if invalid and not valid_ids:
-            continue
+        rejected.extend(eid for eid in finding.evidence_ids if eid not in allowed_ids)
         kept.append(finding.model_copy(update={"evidence_ids": valid_ids}))
     return kept, rejected
 
@@ -84,4 +86,3 @@ def validate_bundle_citations(
 ) -> tuple[EvidenceBundle, list[str]]:
     items, rejected = filter_evidence_items(bundle.items, allowed_ids)
     return bundle.model_copy(update={"items": items}), rejected
-

@@ -145,6 +145,10 @@ class AssertionAssessment(BaseModel):
     assertion_text: str
     status: Literal["supported", "unsupported", "contradicted", "injection_suspected"]
     evidence_ids: list[str] = Field(default_factory=list)
+    supporting_quote: str = Field(
+        default="",
+        description="Verbatim excerpt from a cited evidence chunk that backs a supported assertion",
+    )
     notes: str = ""
 
 
