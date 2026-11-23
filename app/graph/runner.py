@@ -35,9 +35,10 @@ async def _checkpointer(path: Path) -> AsyncIterator[AsyncSqliteSaver]:
 def _initial_state(request: AnalysisRequest, analysis_id: str | None = None) -> dict[str, object]:
     return {
         "analysis_id": analysis_id or "",
-        "request": request.model_dump(),
+        "request": request.model_dump(mode="json"),
         "domain_pack_id": request.domain_pack_id,
         "deterministic_signals": None,
+        "changed_files": [],
         "plan": None,
         "change_impact": None,
         "evidence": None,

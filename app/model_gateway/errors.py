@@ -19,7 +19,9 @@ def is_daily_quota_exhausted(exc: BaseException) -> bool:
     """True when the free-tier per-day request cap is exhausted (retry won't help today)."""
     text = str(exc)
     upper = text.upper()
-    if "PERDAY" in upper or "PER_DAY" in upper:
+    # Wordings seen so far: quotaId "...PerDayPerProjectPerModel-FreeTier" (2026-09) and
+    # "Generate content requests per day limit exceeded on Free Tier" (2026-11).
+    if "PERDAY" in upper or "PER_DAY" in upper or "PER DAY" in upper:
         return True
     if "GENERATEREQUESTSPERDAY" in upper.replace("_", ""):
         return True

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar, cast
 
@@ -10,8 +12,12 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, ValidationError
 
 from app.core.settings import Settings, get_settings
+from app.model_gateway.errors import is_transient_api_error
+from app.model_gateway.pacing import AsyncMinIntervalPacer
 
 T = TypeVar("T", bound=BaseModel)
+
+logger = logging.getLogger(__name__)
 
 
 class StructuredOutputError(Exception):
@@ -58,10 +64,20 @@ class GeminiStructuredLLM:
         settings: Settings | None = None,
         *,
         client_max_retries: int | None = None,
+        pacer: AsyncMinIntervalPacer | None = None,
+        transient_retries: int = 0,
+        transient_backoff_seconds: float = 20.0,
     ) -> None:
-        """Pass client_max_retries=0 in eval scripts to disable SDK tenacity bursts."""
+        """Pass client_max_retries=0 in eval scripts to disable SDK tenacity bursts.
+
+        pacer spaces call starts (shared across parallel agents) to stay under a
+        provider RPM limit; without it, parallel fan-out bursts straight into 429s.
+        """
         self._settings = settings or get_settings()
         self._client_max_retries = client_max_retries
+        self._pacer = pacer
+        self._transient_retries = transient_retries
+        self._transient_backoff = transient_backoff_seconds
 
     async def generate(
         self,
@@ -81,12 +97,30 @@ class GeminiStructuredLLM:
             llm_kwargs["max_retries"] = self._client_max_retries
         llm = ChatGoogleGenerativeAI(**llm_kwargs)
         structured = llm.with_structured_output(schema, include_raw=True)
-        result = await structured.ainvoke(
-            [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_prompt),
-            ],
-        )
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        attempt = 0
+        while True:
+            if self._pacer is not None:
+                await self._pacer.wait_turn()
+            try:
+                result = await structured.ainvoke(messages)
+                break
+            except Exception as exc:
+                # Only provider overload (503/5xx) is retried here, with growing waits.
+                # 429s and daily-quota errors propagate: retrying them burns quota.
+                if attempt >= self._transient_retries or not is_transient_api_error(exc):
+                    raise
+                attempt += 1
+                wait = self._transient_backoff * attempt
+                logger.warning(
+                    "%s transient error (attempt %d/%d), retrying in %.0fs: %s",
+                    model,
+                    attempt,
+                    self._transient_retries,
+                    wait,
+                    str(exc)[:120],
+                )
+                await asyncio.sleep(wait)
         if not isinstance(result, dict):
             msg = f"Unexpected structured output container: {type(result).__name__}"
             raise StructuredOutputError(msg)

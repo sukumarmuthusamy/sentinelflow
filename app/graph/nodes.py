@@ -103,7 +103,7 @@ def _trace_update(ctx: AnalysisGraphContext) -> dict[str, Any]:
             input_tokens=ctx.trace.input_tokens,
             output_tokens=ctx.trace.output_tokens,
             citations_rejected=ctx.trace.citations_rejected,
-        ).model_dump(),
+        ).model_dump(mode="json"),
     }
 
 
@@ -139,19 +139,41 @@ def deterministic_signal_layer(state: GraphState, config: RunnableConfig) -> dic
         ctx.domain_pack,
         fixture_only=True,
     )
-    return {"deterministic_signals": signals.model_dump()}
+    return {
+        "deterministic_signals": signals.model_dump(mode="json"),
+        "changed_files": list(manifest.changed_files),
+    }
+
+
+def triage_change_summary(signals: DeterministicSignals | None, changed_files: list[str]) -> str:
+    """What the Triage Planner may see: observable change facts, never fixture labels.
+
+    Fixture manifests also carry ``category``, ``description`` and ``expected_decision``.
+    Those are ground truth for plan-selection accuracy (M6), so they are excluded.
+    """
+    lines = [f"changed_files={changed_files[:20]}"]
+    if signals is not None:
+        contract = signals.contract_diff
+        security = signals.security
+        lines += [
+            f"primary_service={signals.primary_service}",
+            f"impacted_services={signals.impacted_services}",
+            f"blast_radius_nodes={len(signals.blast_radius.affected_nodes)} "
+            f"max_depth={signals.blast_radius.max_depth}",
+            f"contract_diff: breaking={contract.breaking} err={contract.err_count} "
+            f"warn={contract.warn_count}",
+            f"security: findings={len(security.findings)} max_severity={security.max_severity} "
+            f"scanners={sorted({finding.scanner for finding in security.findings})}",
+            f"tests: required={len(signals.required_tests)} "
+            f"available={len(signals.available_tests)}",
+        ]
+    return "\n".join(lines)
 
 
 async def triage_planner_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     ctx = _ctx(config)
     request = _request(state)
-    signals = _signals(state)
-    summary = ""
-    if signals is not None:
-        summary = (
-            f"change_id={signals.change_id} primary_service={signals.primary_service} "
-            f"impacted={signals.impacted_services}"
-        )
+    summary = triage_change_summary(_signals(state), list(state.get("changed_files") or []))
     try:
         proposed = await run_triage_planner(
             ctx.llm,
@@ -164,17 +186,17 @@ async def triage_planner_node(state: GraphState, config: RunnableConfig) -> dict
         )
     except BudgetExhaustedError as exc:
         plan = default_plan_for_pack(ctx.domain_pack)
-        return {"plan": plan.model_dump(), **_degraded(exc.reason), **_trace_update(ctx)}
+        return {"plan": plan.model_dump(mode="json"), **_degraded(exc.reason), **_trace_update(ctx)}
     except StructuredOutputError as exc:
         # Plan section 2: an invalid plan clamps to the default; it is not retried.
         plan = default_plan_for_pack(ctx.domain_pack)
         return {
-            "plan": plan.model_dump(),
+            "plan": plan.model_dump(mode="json"),
             "errors": [f"triage plan invalid, clamped to default: {exc}"],
             **_trace_update(ctx),
         }
     plan = validate_analysis_plan(proposed, ctx.domain_pack)
-    return {"plan": plan.model_dump(), **_trace_update(ctx)}
+    return {"plan": plan.model_dump(mode="json"), **_trace_update(ctx)}
 
 
 def plan_fan_out(state: GraphState) -> list[Send]:
@@ -231,9 +253,9 @@ async def _dispatch_agent(
             model=ctx.agent_model,
             temperature=ctx.agent_temperature,
             request=request,
-            signals=signals.model_dump() if signals else {},
+            signals=signals.model_dump(mode="json") if signals else {},
         )
-        return {"change_impact": impact.model_dump()}
+        return {"change_impact": impact.model_dump(mode="json")}
     if agent == "evidence_investigator":
         if ctx.retrieval is None:
             return {"errors": ["retrieval service unavailable"]}
@@ -250,9 +272,9 @@ async def _dispatch_agent(
             queries=queries,
         )
         return {
-            "evidence": bundle.model_dump(),
+            "evidence": bundle.model_dump(mode="json"),
             "retrieved_evidence_ids": sorted(outcome.allowed_ids),
-            "retrieved_chunks": [chunk.model_dump() for chunk in outcome.chunks],
+            "retrieved_chunks": [chunk.model_dump(mode="json") for chunk in outcome.chunks],
             "rejected_evidence_ids": outcome.rejected_ids,
         }
     if agent == "test_strategist":
@@ -265,7 +287,7 @@ async def _dispatch_agent(
             temperature=ctx.agent_temperature,
             request=request,
         )
-        return {"regression_plan": plan.model_dump()}
+        return {"regression_plan": plan.model_dump(mode="json")}
     if agent == "security_auditor":
         findings, outcome = await run_security_auditor(
             ctx.llm,
@@ -281,7 +303,7 @@ async def _dispatch_agent(
         # The verifier validates against retrieved_evidence_ids, so the auditor's
         # evidence must land there too or its valid citations get stripped.
         return {
-            "security_findings": findings.model_dump(),
+            "security_findings": findings.model_dump(mode="json"),
             "retrieved_evidence_ids": sorted(outcome.allowed_ids),
             "rejected_evidence_ids": outcome.rejected_ids,
         }
@@ -333,8 +355,8 @@ async def evidence_verifier_node(state: GraphState, config: RunnableConfig) -> d
 
     metrics = compute_verification_metrics(assertions, report, signals=_signals(state))
     return {
-        "verification": report.model_dump(),
-        "verification_metrics": metrics.model_dump(),
+        "verification": report.model_dump(mode="json"),
+        "verification_metrics": metrics.model_dump(mode="json"),
         "evidence_gaps": list(metrics.unsupported_ids),
         "rejected_evidence_ids": rejected,
         **_trace_update(ctx),
@@ -417,9 +439,10 @@ async def focused_retrieval_repair(state: GraphState, config: RunnableConfig) ->
     )
     prior_chunks = list(state.get("retrieved_chunks") or [])
     return {
-        "evidence": merged.model_dump(),
+        "evidence": merged.model_dump(mode="json"),
         "retrieved_evidence_ids": sorted(existing_ids | outcome.allowed_ids),
-        "retrieved_chunks": prior_chunks + [chunk.model_dump() for chunk in outcome.chunks],
+        "retrieved_chunks": prior_chunks
+        + [chunk.model_dump(mode="json") for chunk in outcome.chunks],
         "rejected_evidence_ids": outcome.rejected_ids,
         "repair_count": repair_count,
         "evidence_gaps": Overwrite([]),
@@ -454,8 +477,8 @@ def risk_engine_node(state: GraphState, config: RunnableConfig) -> dict[str, Any
         component_scores=risk.weighted_components,
     )
     return {
-        "deterministic_signals": updated.model_dump(),
-        "risk_assessment": assessment.model_dump(),
+        "deterministic_signals": updated.model_dump(mode="json"),
+        "risk_assessment": assessment.model_dump(mode="json"),
     }
 
 
@@ -483,7 +506,7 @@ def degrade_review_node(state: GraphState, config: RunnableConfig) -> dict[str, 
             confidence=0.0,
             override_applied="budget_or_recursion",
         )
-        return {"risk_assessment": assessment.model_dump(), "degraded_to_review": True}
+        return {"risk_assessment": assessment.model_dump(mode="json"), "degraded_to_review": True}
 
     risk = compute_risk_score(signals, ctx.domain_pack)
     gate = apply_policy_gate(signals, ctx.domain_pack, risk)
@@ -494,7 +517,7 @@ def degrade_review_node(state: GraphState, config: RunnableConfig) -> dict[str, 
         override_applied=gate.override_applied or "budget_or_recursion",
         component_scores=risk.weighted_components,
     )
-    return {"risk_assessment": assessment.model_dump(), "degraded_to_review": True}
+    return {"risk_assessment": assessment.model_dump(mode="json"), "degraded_to_review": True}
 
 
 def report_builder_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
@@ -532,7 +555,7 @@ def report_builder_node(state: GraphState, config: RunnableConfig) -> dict[str, 
         evidence_coverage=metrics.evidence_coverage if metrics is not None else None,
         requires_human_approval=request.record_decision,
     )
-    return {"final_report": report.model_dump()}
+    return {"final_report": report.model_dump(mode="json")}
 
 
 def human_approval_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:

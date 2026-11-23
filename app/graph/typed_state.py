@@ -43,6 +43,8 @@ class GraphState(TypedDict):
     request: dict[str, Any]
     domain_pack_id: str
     deterministic_signals: dict[str, Any] | None
+    # Changed file paths only; manifest labels (category, expected decision) never enter state.
+    changed_files: list[str]
     plan: dict[str, Any] | None
     change_impact: dict[str, Any] | None
     evidence: dict[str, Any] | None

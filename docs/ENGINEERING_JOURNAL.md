@@ -126,3 +126,20 @@ Tests: `tests/unit/test_verification_metrics.py`, `tests/unit/test_risk_engine.p
 Related fixes in the same pass: budget exhaustion inside an agent now degrades to `REVIEW` instead of raising through `RetryPolicy`, and degradation never weakens a deterministic `BLOCK`; token usage is captured from the provider (`include_raw=True`) so the token budget is real; citations stripped by the evidence-ID validator are recorded (`rejected_evidence_ids`) so "zero invented IDs" is measurable; the policy's `category_agent_map` is enforced as a floor on the triage plan.
 
 Tests: `tests/unit/test_evidence_queries.py`, `tests/unit/test_budget.py`, `tests/graph/test_gate_integrity.py`.
+
+---
+
+## M4 live run: 503s spend the daily quota, and 20 requests/day cannot fit the sample
+
+**What looked wrong.** The first live trajectory (2026-11-22, new AI Studio project) failed on `503 UNAVAILABLE` ("model is currently experiencing high demand") from `gemini-3.8-flash`. A second attempt with transient retries saw only 503s, and then the model returned `429` with "requests per day limit exceeded on Free Tier, limit: 20", retry in about 7.5 hours.
+
+**Investigation.** A one-request probe per model showed `gemini-3-flash-preview`, `gemini-3.5-flash` and `gemini-3.5-flash-lite` answering normally while `gemini-3.8-flash` was out of daily quota, after about 20 attempts that were nearly all 503s. So 503 responses count toward the daily cap. Separately, a single trajectory costs 5–7 generation calls (four specialists, verifier, plus one repair and a re-verify when coverage is low). The five-scenario sample needs about 30 calls, more than the 20/day cap even with zero failures. Two code faults surfaced: one 503 in one parallel branch failed the whole graph (LangGraph's node `RetryPolicy` retried after 0.5 s, too soon for an overload), and `is_daily_quota_exhausted` did not recognise the November error wording, so the sample would have kept burning requests after the cap.
+
+**Root cause.** Free-tier capacity, not a project bug. It is made worse by retries that spend quota on an overloaded model.
+
+**Decision.**
+
+- `GeminiStructuredLLM` takes a shared `pacer` (all parallel agents queue behind one 5 RPM limit) and `transient_retries` with growing waits (20 s, 40 s, …) for 503/5xx only. 429s and daily-quota errors fail fast.
+- The quota classifier handles both wordings (`tests/unit/test_provider_errors.py`), and `run_m4_sample.py` stops at the first daily-quota error.
+- On this tier the primary model cannot carry the full sample in one day. Live validation ran one trajectory on `gemini-3-flash-preview` as a stand-in for the agents: it completed in 98 s with 7 calls, 0 invented evidence IDs and 0 invalid citations. The verifier *contradicted* the Change Analyst's "zero functional risk" hypothesis for the docs-only change CHG-H001, citing three policy and ownership chunks. Computed coverage was 0.0 against a self-reported 1.0, so the gate returned REVIEW where the fixture label says PASS. That is a real disagreement between agents, which the self-reported number would have hidden. Whether the label or the policy corpus is right is an M6 calibration question.
+- The same run showed the Triage Planner classifying that change as `unknown`. It only saw the change ID and service names. It now gets changed file paths and a deterministic-signal summary, but never the fixture's `category`, `description` or `expected_decision`, which are ground truth for plan-selection accuracy (`tests/unit/test_triage_input.py`).
