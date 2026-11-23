@@ -1,4 +1,4 @@
-"""AG M2 hardening: renamed files, fork boundaries and scanner failures (offline)."""
+"""GitHub source hardening: renamed files, fork boundaries and scanner failures (offline)."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def _rename(fake: FakeGitHub, number: int, *, previous: Any, filename: str, **ex
 
 class TestRenamedFiles:
     def test_contract_renamed_away_from_its_declared_path_cannot_pass(self) -> None:
-        # AG probe A: this used to resolve to svc-analytics, not_applicable, no gaps -> PASS.
+        # Regression: this used to resolve to svc-analytics, not_applicable, no gaps -> PASS.
         fake = FakeGitHub.recorded()
         _rename(fake, 80, previous=CONTRACT, filename="analytics_docs/old-contract.yaml")
         fake.contents[f"{PR7_HEAD}:analytics_docs/old-contract.yaml"] = b"openapi: 3.1.0\n"
