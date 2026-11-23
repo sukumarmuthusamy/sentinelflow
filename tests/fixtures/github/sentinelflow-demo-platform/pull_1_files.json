@@ -1,0 +1,11 @@
+[
+  {
+    "sha": "2bc88635314d91e3fe7f7163dded2e2a279ddede",
+    "filename": "analytics_docs/readme.py",
+    "status": "modified",
+    "additions": 4,
+    "deletions": 0,
+    "changes": 4,
+    "patch": "@@ -5,4 +5,8 @@\n \n Synthetic documentation for svc-analytics reporting pipelines.\n This module is intentionally non-code and should not affect blast radius.\n+\n+## Reporting cadence\n+- Daily aggregate rollups at 02:00 UTC\n+- Weekly payer mix reports on Mondays\n \"\"\""
+  }
+]

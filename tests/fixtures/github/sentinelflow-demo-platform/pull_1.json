@@ -1,0 +1,26 @@
+{
+  "number": 1,
+  "title": "docs: expand analytics documentation",
+  "state": "open",
+  "draft": false,
+  "merged": false,
+  "body": "Synthetic demo PR for SentinelFlow live-mode evaluation.\r\n\r\nBranch: `pr/001-docs-analytics`\r\nGround truth: see `eval/pr-ground-truth.yaml`",
+  "changed_files": 1,
+  "additions": 4,
+  "deletions": 0,
+  "html_url": "https://github.com/sukumarmuthusamy/sentinelflow-demo-platform/pull/1",
+  "base": {
+    "ref": "main",
+    "sha": "e161b07e02c445f322a6124216e30229625c2919",
+    "repo": {
+      "full_name": "sukumarmuthusamy/sentinelflow-demo-platform"
+    }
+  },
+  "head": {
+    "ref": "pr/001-docs-analytics",
+    "sha": "553443d050718b0bc334eace4a32c1bf88708a32",
+    "repo": {
+      "full_name": "sukumarmuthusamy/sentinelflow-demo-platform"
+    }
+  }
+}

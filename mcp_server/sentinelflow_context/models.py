@@ -14,8 +14,33 @@ from app.graph.state import ReleaseDecision
 from pydantic import BaseModel, Field
 
 
+class GitHubPullRequestRef(BaseModel):
+    """Where a GitHub-sourced change package came from.
+
+    ``title`` is author-controlled text: sanitized and truncated, kept for the audit
+    record, and never part of what agents observe.
+    """
+
+    repository: str
+    number: int
+    title: str
+    state: str
+    draft: bool
+    base_sha: str
+    head_sha: str
+    html_url: str
+    changed_file_count: int
+    files_without_patch: list[str] = Field(default_factory=list)
+    unmapped_files: list[str] = Field(default_factory=list)
+
+
 class ChangePackageResponse(BaseModel):
-    """Fixture-backed change package returned by get_change_package."""
+    """Normalized change package returned by get_change_package (fixture or GitHub).
+
+    ``gaps`` lists data the source could not supply. A non-empty list means the
+    deterministic signals are incomplete, and the graph degrades the run to REVIEW.
+    ``notes`` are disclosed limitations that do not make the data incomplete.
+    """
 
     change_id: str
     source: Literal["fixture", "github"]
@@ -25,7 +50,10 @@ class ChangePackageResponse(BaseModel):
     primary_service: str
     changed_files: list[str] = Field(default_factory=list)
     origin_nodes: list[str] = Field(default_factory=list)
-    fixture_path: str
+    fixture_path: str | None = None
+    github: GitHubPullRequestRef | None = None
+    gaps: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class DependencyGraphResponse(BaseModel):

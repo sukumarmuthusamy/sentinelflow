@@ -305,3 +305,87 @@ This is the first live run on the hardened graph: commit `a6636e6`, prompts v3, 
 - Tool-derived assertions (contract diff, scanner output, blast radius) should be verifiable against the deterministic signals that produced them, rather than counted as unsupported prose.
 - The doc-only blast-radius attribution needs a deterministic fix.
 - Until then, a documentation change cannot reach PASS on this corpus, so PASS recall is unmeasured.
+
+## M2 GitHub source: the stub hid a second bypass, and missing scanners read as clean
+
+**What looked wrong.** M2 was marked complete, but `get_change_package(source="github")` raised a `ToolError` stub. The exit criterion ("the same scenario runs identically against a fixture and against a real GitHub PR") had never been exercised.
+
+**Investigation.**
+
+- *Boundary.* Agents read change data through the MCP client. The graph's `deterministic_signal_layer` does not: it reads the fixture directory from disk. For fixtures that is harmless, but a live source has no directory, so replacing the stub alone would not have been enough.
+- *Fail-open tools.* The M1 scanner wrappers return an empty `SecurityScanResult` when gitleaks or semgrep is not installed, or when a run fails, and that result cannot be told apart from a clean scan. Fixture mode never hits this because it reads recorded signals. A live PR would have passed a secret change on any machine without gitleaks.
+- *oasdiff parsing.* `oasdiff breaking --format json` encodes `level` as an integer (3 = ERR). The parser upper-cased the value and mapped anything it did not recognize to INFO, so a real breaking change would have scored as non-breaking. Fixture mode reads recorded JSON with string levels, so this never showed.
+
+**Root cause.** GitHub mode was deferred until a seed repository existed. In the meantime, the fixture-only path made every live-tool assumption untestable.
+
+**Decision.**
+
+- GitHub PRs are read inside `sentinelflow-context` with GET-only REST calls and normalized into the fixture shape ([ADR-0002](adr/0002-github-change-source.md)). Each pack's `live_source.yaml` names the repository and the path-to-service rules. The runner pins `source` on change-scoped MCP calls, so no agent code changed. For live sources, the deterministic node builds its signals from the same five MCP tools the agents use. A test checks that, for all eight fixtures, this produces exactly the signals of the on-disk path.
+- The GitHub path has its own fail-closed wrappers: a missing tool or a non-zero exit returns "unavailable", and the change data records that as a gap. Gaps degrade the run to REVIEW before any LLM call and never weaken a BLOCK. Images are never pulled implicitly. gitleaks output is redacted.
+- The oasdiff parser now maps numeric levels. This is a fix to shared M1 code, but fixture mode is unaffected because it reads recorded JSON. The mapping comes from oasdiff's documented output and has not yet been checked against a real oasdiff run on this machine.
+- Thresholds, weights and labels were left unchanged.
+
+**Live result (2026-11-23, read-only, no token).** Seed PRs 1, 7, 2 and 8 normalized to the same primary services as CHG-H001, CHG-H002, CHG-E001 and CHG-E002. Every PR ended at REVIEW because neither oasdiff nor gitleaks is installed here. CHG-E001 and seed PR 2 also differ in blast radius: the fixture starts its docs change at `svc-inventory`, while the H001 convention, which GitHub mode follows, starts a non-code file at the file. That fixture inconsistency is recorded for M6 and not changed here.
+
+Tests: `tests/contract/test_github_source.py`, `tests/graph/test_github_change_source.py`, `tests/unit/test_github_signal_tools.py`.
+
+## M2 live run with real scanners: the pipeline holds, two seed scenarios do not trigger the tools
+
+**What looked wrong.** I reran the live smoke test with `tufin/oasdiff` (digest `e6afae33…`, build `059301e`) and `zricethezav/gitleaks:v8.30.1` (digest `c00b6bd0…`). Both ran in disposable containers with `--pull=never`, `--network=none` and a read-only input mount. No gaps were left, but only two of the four equivalent pairs matched their fixtures:
+
+- seed PR 1 matched CHG-H001 (PASS 10);
+- seed PR 8 matched CHG-E002 (BLOCK, `critical-contract-break`).
+
+Seed PR 7 and seed PR 10 both reached PASS, while their fixtures (CHG-H002 and CHG-H003) block.
+
+**Investigation.**
+
+- *PR 8.* Real oasdiff output encodes `level` as the integer 3, which confirms the numeric-level fix from the previous entry. Without that fix, this BLOCK would have been scored as non-breaking.
+- *PR 7.* oasdiff reports one `request-property-removed` change at level 2 (WARN). It also reports some INFO changes: `api-schema-removed`, `api-version-changed` and `response-non-success-status-removed`. None of them is an ERR, so `critical-contract-break` does not fire. The seed's ground truth says oasdiff should emit ERR, and for this diff it does not.
+- *PR 10.* gitleaks' trace log shows the seed's AWS key ending in `EXAMPLE` being skipped twice:
+  - the `aws-access-token` rule's allowlist (`.+EXAMPLE$`) drops it;
+  - the `generic-api-key` stopword `example` drops it.
+
+  The same container command does detect a randomly generated AWS-format key, and the output is redacted. Seed PRs 11 and 12 fail the same way: the global stopword `abcdefghijklmnopqrstuvwxyz` drops their token and key bodies, because those bodies contain sequential letters.
+
+**Root cause.** The seed scenarios were written with placeholder secrets and a contract change that the real tools classify as non-blocking. The fixtures recorded the intended verdicts rather than tool output. The pipeline is behaving correctly.
+
+**Decision.**
+
+- Nothing was changed to make the pairs match. Thresholds, gitleaks' default config, oasdiff's rules, the fixtures and the seed repository are all as they were.
+- Fixing these scenarios belongs in the seed repository: a secret that gitleaks' default rules detect, and a contract change that oasdiff rates ERR. That decision is the owner's, so it is recorded here and not made.
+
+A pre-existing labeling issue also surfaced. `dependency_vuln_at_or_above_ceiling` checks the overall `security.max_severity`. As a result, CHG-H003's critical secret is reported as `dependency-vuln-ceiling` rather than `secret-exposure`. The decision is the same, but the label is misleading. This is left for M6.
+
+Evidence: `evals/github/m2_live_smoke_tools.json`.
+
+## M2 hardening: five fail-open paths in the GitHub source, and a sixth in gitleaks' own config loading
+
+**What looked wrong.** An independent review of `e1da9d0..a19f81f` found five medium-severity gaps, and each one reproduced locally:
+
+- **Renames.** A rename that moved `contracts/svc-core-api.yaml` out of its declared path resolved to `svc-analytics`, with contract diff `not_applicable` and no gaps. The result was PASS.
+- **Scanner output.** Truncated or unexpected oasdiff JSON, and a gitleaks report that was not a list, both parsed as clean.
+- **Docker.** The images were tag-referenced (oasdiff at `latest`), and the containers ran without resource or privilege limits.
+- **Forks.** For a fork PR, head contents were requested from `head.repo.full_name`, with the token attached.
+- **Timeouts.** `subprocess.TimeoutExpired` escaped the scanner wrappers, and the container kept running.
+
+**Investigation.**
+
+- *Renames.* Normalization ignored `previous_filename` for service ownership and contract detection. An unsafe previous path was dropped silently, and the base version was then read from the new path.
+- *Parsing.* Both parsers treated "not recognised" as "no findings". oasdiff output fell back to a line regex that never matches oasdiff's real text format.
+- *Forks.* A probe against a public fork PR showed that the base repository's Contents API serves the fork's head SHA (200, also via `refs/pull/<n>/head`). An unknown SHA returns 404. So reading from the fork was never needed.
+- *Timeouts.* The first fix removed the container by name after a timeout. A forced timeout against the real image left a container in the `Created` state: the CLI was killed between create and start, so `rm -f` ran before the container existed. Creating the container synchronously with `docker create`, starting it with `docker start --attach`, and always removing it afterwards closed the race. Four repeated forced timeouts left nothing.
+- *gitleaks configuration (found while verifying the fix).* gitleaks v8.30.1 reads `.gitleaks.toml` and `.gitleaksignore` from the scan target and honours inline `gitleaks:allow`. A PR controls all three. Planting each one suppressed a real detection.
+- *M1 `run_oasdiff`.* It mounted only the base spec's directory, and both fixtures keep base and revision in sibling directories under the same file name. So it diffed the base against itself and reported a clean result. This only affects `fixture_only=False`, which no default caller uses.
+
+**Root cause.** The live path inherited M1's habit of turning anything it could not interpret into an empty result. The pull request metadata (head repository, previous path) was trusted more than the configuration.
+
+**Decision.**
+
+- *Parsing.* Both parsers are strict. Every scanner failure mode raises `ScannerError` with a fixed reason. That error becomes a gap (REVIEW), and it never weakens a deterministic BLOCK.
+- *Repository boundary.* Every request targets the configured repository, and `GitHubApi` enforces this.
+- *Renames.* Renamed files count at both paths.
+- *Docker.* Images are pinned to their registry OCI index digests, which were verified with `docker buildx imagetools inspect`. A gitleaks binary on PATH is used only at exactly 8.30.1. Containers run under `app/deterministic/docker_sandbox.py`.
+- *gitleaks configuration.* gitleaks gets an explicit default config and a trusted ignore path, PR files are staged one level below the target, and inline allow comments are ignored. Its default rule allowlists, such as the one for AWS `EXAMPLE` keys, are unchanged.
+
+Tests: `tests/contract/test_github_hardening.py`, `tests/unit/test_github_signal_tools.py`, and the scanner-failure and rename cases in `tests/graph/test_github_change_source.py`.

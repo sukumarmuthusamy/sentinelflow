@@ -3,75 +3,86 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
 
+from app.deterministic.docker_sandbox import Mount, image_present, run_sandboxed
 from app.deterministic.models import ContractChange, ContractDiffResult
-from app.deterministic.subprocess_util import command_available, docker_available, run_command
+from app.deterministic.subprocess_util import command_available, run_command
+
+# Pinned by registry digest (OCI image index): tufin/oasdiff, build 059301e. To
+# install: docker pull tufin/oasdiff@sha256:e6afae33... (the full reference below).
+OASDIFF_IMAGE = (
+    "tufin/oasdiff@sha256:e6afae33552b0c2cbd1d00883cdbf03b8b9b05ebb4d2f8d8cb8392ddb48837d5"
+)
 
 
 class OasDiffOptions(BaseModel):
     """Configuration for oasdiff execution."""
 
-    docker_image: str = "tufin/oasdiff"
+    docker_image: str = OASDIFF_IMAGE
     timeout_seconds: int = 120
 
 
-def _parse_oasdiff_output(stdout: str, stderr: str) -> ContractDiffResult:
-    payload = stdout.strip() or stderr.strip()
-    if not payload:
-        return ContractDiffResult(tool="oasdiff")
+class OasDiffOutputError(ValueError):
+    """oasdiff output that cannot be trusted as a verdict (never read as "clean")."""
 
+
+_OASDIFF_NUMERIC_LEVELS = {"3": "ERR", "2": "WARN", "1": "INFO"}
+_OASDIFF_LEVELS = {"ERR", "WARN", "INFO"}
+
+
+def parse_oasdiff_output(stdout: str) -> ContractDiffResult:
+    """Parse ``oasdiff breaking --format json`` output strictly.
+
+    Accepted: a JSON list of change records (``[]`` means no differences), or an
+    object whose ``changes`` is such a list. Each record must be an object with a
+    recognised ``level`` (``severity``): 3/2/1 or ERR/WARN/INFO. Anything else,
+    including empty, truncated or non-JSON output, raises ``OasDiffOutputError``.
+    """
+    payload = stdout.strip()
+    if not payload:
+        msg = "oasdiff produced no output"
+        raise OasDiffOutputError(msg)
     try:
         parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        return _parse_oasdiff_text(payload)
+    except json.JSONDecodeError as exc:
+        msg = "oasdiff output is not valid JSON"
+        raise OasDiffOutputError(msg) from exc
 
-    changes: list[ContractChange] = []
     if isinstance(parsed, list):
-        for item in parsed:
-            if not isinstance(item, dict):
-                continue
-            level = str(item.get("level", item.get("severity", "INFO"))).upper()
-            if level not in {"ERR", "WARN", "INFO"}:
-                level = "INFO"
-            changes.append(
-                ContractChange(
-                    level=level,  # type: ignore[arg-type]
-                    message=str(item.get("text", item.get("comment", item.get("message", "")))),
-                    path=item.get("path") if isinstance(item.get("path"), str) else None,
-                )
-            )
-    elif isinstance(parsed, dict) and "changes" in parsed and isinstance(parsed["changes"], list):
-        for item in parsed["changes"]:
-            if isinstance(item, dict):
-                level = str(item.get("level", "INFO")).upper()
-                changes.append(
-                    ContractChange(
-                        level=level if level in {"ERR", "WARN", "INFO"} else "INFO",  # type: ignore[arg-type]
-                        message=str(item.get("text", "")),
-                        path=item.get("path") if isinstance(item.get("path"), str) else None,
-                    )
-                )
-
-    return _summarize_changes(changes, tool="oasdiff")
+        items: list[object] = parsed
+    elif isinstance(parsed, dict) and isinstance(parsed.get("changes"), list):
+        items = parsed["changes"]
+    else:
+        msg = "oasdiff output has an unrecognised shape"
+        raise OasDiffOutputError(msg)
+    return _summarize_changes([_parse_change(item) for item in items], tool="oasdiff")
 
 
-def _parse_oasdiff_text(payload: str) -> ContractDiffResult:
-    changes: list[ContractChange] = []
-    for line in payload.splitlines():
-        match = re.match(r"^(ERR|WARN|INFO)\s*:\s*(.+)$", line.strip(), flags=re.IGNORECASE)
-        if match:
-            changes.append(
-                ContractChange(
-                    level=match.group(1).upper(),  # type: ignore[arg-type]
-                    message=match.group(2).strip(),
-                )
-            )
-    return _summarize_changes(changes, tool="oasdiff")
+def _parse_change(item: object) -> ContractChange:
+    if not isinstance(item, dict):
+        msg = "oasdiff change record is not an object"
+        raise OasDiffOutputError(msg)
+    raw_level = item.get("level", item.get("severity"))
+    if isinstance(raw_level, bool) or not isinstance(raw_level, (int, str)):
+        msg = "oasdiff change record has no valid level"
+        raise OasDiffOutputError(msg)
+    level = str(raw_level).strip().upper()
+    # oasdiff's JSON encodes level as an integer (3=ERR, 2=WARN, 1=INFO).
+    level = _OASDIFF_NUMERIC_LEVELS.get(level, level)
+    if level not in _OASDIFF_LEVELS:
+        msg = "oasdiff change record has an unknown level"
+        raise OasDiffOutputError(msg)
+    message = item.get("text", item.get("comment", item.get("message", "")))
+    path = item.get("path")
+    return ContractChange(
+        level=level,  # type: ignore[arg-type]
+        message=message if isinstance(message, str) else str(message),
+        path=path if isinstance(path, str) else None,
+    )
 
 
 def _summarize_changes(
@@ -98,33 +109,37 @@ def run_oasdiff(
     *,
     options: OasDiffOptions | None = None,
 ) -> ContractDiffResult:
-    """Run oasdiff via the official Docker image and return a typed verdict."""
+    """Run oasdiff in a locked-down container; any failure is ``unavailable``."""
     if not base_spec.is_file() or not revision_spec.is_file():
         msg = "OpenAPI spec paths must exist"
         raise FileNotFoundError(msg)
 
     opts = options or OasDiffOptions()
-    mount_dir = base_spec.parent.resolve()
-    argv = [
-        "docker",
-        "run",
-        "--rm",
-        "-v",
-        f"{mount_dir}:/specs:ro",
-        "-w",
-        "/specs",
-        opts.docker_image,
-        "breaking",
-        base_spec.name,
-        revision_spec.name,
-        "--format",
-        "json",
-    ]
-    if not docker_available():
+    if not image_present(opts.docker_image):
         return ContractDiffResult(tool="unavailable")
-
-    result = run_command(argv, timeout_seconds=opts.timeout_seconds)
-    return _parse_oasdiff_output(result.stdout, result.stderr)
+    # Each spec's directory is mounted on its own: fixtures keep base and revision
+    # in sibling directories under the same file name.
+    result = run_sandboxed(
+        image=opts.docker_image,
+        command=[
+            "breaking",
+            f"/specs/base/{base_spec.name}",
+            f"/specs/revision/{revision_spec.name}",
+            "--format",
+            "json",
+        ],
+        mounts=[
+            Mount(base_spec.parent, "/specs/base"),
+            Mount(revision_spec.parent, "/specs/revision"),
+        ],
+        timeout_seconds=opts.timeout_seconds,
+    )
+    if not result.ok:
+        return ContractDiffResult(tool="unavailable")
+    try:
+        return parse_oasdiff_output(result.stdout)
+    except OasDiffOutputError:
+        return ContractDiffResult(tool="unavailable")
 
 
 def run_buf_breaking(

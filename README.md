@@ -8,12 +8,12 @@ SentinelFlow ingests a proposed software change and produces an **evidence-cited
 |---|---|---|
 | **M0** | Complete | Typed contracts, FastAPI skeleton, domain-pack loader, CI (ruff, mypy, pytest) |
 | **M1** | Complete | Deterministic signal layer: import graph, blast radius, oasdiff/buf, security scanners, risk engine, policy gate |
-| **M2** | Complete | `sentinelflow-context` MCP server (7 tools, 3 resources), typed client adapter |
+| **M2** | Complete | `sentinelflow-context` MCP server (7 tools, 3 resources), typed client adapter, read-only GitHub PR change source behind the same tools |
 | **M3** | Complete | Hybrid RAG, pgvector + Qdrant adapters, Gemini embeddings, reranker ablation (none vs Voyage), eval harness |
-| **M4** | In review | LangGraph workflow, five agents, triage planner, checkpoint + approval interrupt. A post-hardening live check ran on an OpenRouter stand-in model across 4 fixtures: both expected BLOCKs held, the 2 expected PASS fixtures returned REVIEW, and 0 invalid citations survived. Evidence coverage was 0% on the templated corpus. The primary Gemini model is not yet evaluated |
+| **M4** | Complete (merged in #1) | LangGraph workflow, five agents, triage planner, checkpoint + approval interrupt. A post-hardening live check ran on an OpenRouter stand-in model across 4 fixtures: both expected BLOCKs held, the 2 expected PASS fixtures returned REVIEW, and 0 invalid citations survived. Evidence coverage was 0% on the templated corpus. The primary Gemini model is not yet evaluated |
 
 Canonical architecture and roadmap: [SENTINELFLOW_PLAN.md](SENTINELFLOW_PLAN.md).  
-Real obstacles and tradeoffs from M0–M3: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
+Real obstacles and tradeoffs from M0–M4: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
 
 ---
 
@@ -130,15 +130,16 @@ Optional for local development. CI and `fixture_only=True` use committed signals
 
 | Tool | Purpose | Install |
 |---|---|---|
-| **oasdiff** | OpenAPI breaking-change detection | **Docker (recommended):** `docker pull tufin/oasdiff` — invoked as `docker run --rm tufin/oasdiff breaking ...` |
+| **oasdiff** | OpenAPI breaking-change detection | **Docker:** `docker pull tufin/oasdiff@sha256:e6afae33552b0c2cbd1d00883cdbf03b8b9b05ebb4d2f8d8cb8392ddb48837d5` (build `059301e`, pinned by digest; never pulled implicitly) |
 | **buf** | Protobuf breaking-change detection | [github.com/bufbuild/buf](https://github.com/bufbuild/buf) — `brew install bufbuild/buf/buf` or release binary. Stubbed with TODO until domain packs ship `.proto` assets. |
-| **gitleaks** | Secret detection | [github.com/gitleaks/gitleaks](https://github.com/gitleaks/gitleaks) — `brew install gitleaks` or GitHub release |
+| **gitleaks** | Secret detection | GitHub mode: `docker pull zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f` (or a gitleaks 8.30.1 binary on PATH). M1 fixture scans: [github.com/gitleaks/gitleaks](https://github.com/gitleaks/gitleaks) |
 | **semgrep** | Static analysis (CE rules) | [github.com/semgrep/semgrep](https://github.com/semgrep/semgrep) — `pip install semgrep` or `brew install semgrep` |
 | **osv-scanner** | Dependency vulnerability scan | [google/osv-scanner](https://google.github.io/osv-scanner/) — `go install github.com/google/osv-scanner/cmd/osv-scanner@latest` or GitHub release |
 
 **Container vs local:**
 
-- **oasdiff** — always runs via the `tufin/oasdiff` Docker image when Docker is available; there is no PyPI package.
+- **oasdiff** — runs only from the digest-pinned `tufin/oasdiff` image, in a locked-down container (`app/deterministic/docker_sandbox.py`); there is no PyPI package. Any failure or unparseable output is `tool=unavailable`, never a clean diff.
+- **Scanner containers** run with `--pull=never --network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=64 --memory=512m --cpus=1`, as an unprivileged user, with read-only inputs. Each gets a unique `sf-scan-<uuid>` name and is force-removed by that name after every run, including timeouts and cancellations.
 - **gitleaks, semgrep, osv-scanner** — subprocess wrappers expect binaries on `PATH`.
 - **buf** — subprocess when installed; otherwise returns `tool=unavailable` and fixtures supply offline signals.
 
@@ -176,12 +177,14 @@ python scripts/verify_mcp_inspector.py
 
 | Tool | Status |
 |---|---|
-| `get_change_package` | **Fixture mode:** reads `manifest.yaml` under `domains/<pack>/fixtures/changes/`. **GitHub mode:** stubbed with explicit `ToolError` (deferred — plan section 15). |
+| `get_change_package` | **Fixture mode:** reads `manifest.yaml` under `domains/<pack>/fixtures/changes/`. **GitHub mode:** normalizes a pull request (see below). |
 | `get_dependency_graph` | Fully wired to M1 `dependency_graph.py` |
-| `diff_contracts` | Fully wired to M1 `contract_diff.py` (fixture signals by default) |
-| `list_tests` | Reads fixture manifest test inventory |
-| `run_tests` | **Dry-run:** returns planned execution + hardened docker flags. **Live execution:** deferred to M7. |
-| `run_security_scan` | Fully wired to M1 `security_scanners.py` (fixture signals by default) |
+| `diff_contracts` | Fully wired to M1 `contract_diff.py` (fixture signals by default; oasdiff on base/head in GitHub mode) |
+| `list_tests` | Reads fixture manifest test inventory (empty in GitHub mode) |
+| `run_tests` | **Dry-run:** returns planned execution + hardened docker flags. **Live execution:** deferred to M7. Refused in GitHub mode. |
+| `run_security_scan` | Fully wired to M1 `security_scanners.py` (fixture signals by default; gitleaks on the PR head in GitHub mode) |
+
+Every change-scoped tool takes `source` (`fixture` by default, or `github`).
 | `record_gate_decision` | Append-only JSONL audit log with idempotency key |
 
 ### Resources
@@ -204,6 +207,29 @@ async with SentinelFlowMcpAdapter(mcp) as client:
 ```
 
 Business/validation failures surface as `ToolError` (`is_error=True` on the wire). Protocol failures map to `McpProtocolError`.
+
+### GitHub change source
+
+`AnalysisRequest(source="github", change_id="PR-7", domain_pack_id=...)` analyses a pull request instead of a fixture ([ADR-0002](docs/adr/0002-github-change-source.md)). Agents are unchanged: the runner pins `source` on every change-scoped MCP call, so a run cannot mix sources and agents never choose where data comes from.
+
+- **Configuration.** The repository and the path-to-service rules come from `domains/<pack>/live_source.yaml`, never from tool input. Both packs point at the synthetic seed repo `sukumarmuthusamy/sentinelflow-demo-platform`.
+- **Access.** GET requests to the GitHub REST API only. `SENTINELFLOW_GITHUB_TOKEN` is optional; for private repos use a fine-grained token with read-only *Pull requests* and *Contents* access. The token is never logged or echoed in errors.
+- **Normalization.** Same `ChangePackageResponse` as fixtures. A code file originates at its owning service and a non-code file at the file itself, as in the fixtures. The PR title is sanitized and kept out of agent input; the body is not stored.
+- **Signals.** oasdiff runs on the base and head versions of each changed contract (for a renamed or copied contract, the base is its original path). gitleaks runs on the head version of each changed file. Both run from digest-pinned local images in locked-down containers. gitleaks gets an explicit default configuration, so a `.gitleaks.toml`, a `.gitleaksignore` or an inline `gitleaks:allow` in the pull request cannot hide a finding. The default rule allowlists are unchanged. The test inventory is empty and semgrep is not run; both are reported as notes.
+- **Repository boundary.** Every request goes to the configured repository, including for a pull request from a fork: the head commit is read through the base repository at its SHA, and the client refuses any other repository, so a token never reaches a fork. If GitHub does not serve the fork's head commit there, the reads become gaps.
+- **Renames.** A renamed file counts at both paths, so moving code out of a service still impacts that service. An unsafe or missing previous path, or a contract moved away from its declared path, is a gap.
+- **Incomplete data degrades.** A missing tool, a scanner that times out, fails or returns invalid output, an unreadable or oversized file, a truncated file list, an unattributed code file or a changed dependency manifest is recorded in `gaps`. The run then degrades to REVIEW before any LLM call (`override_applied = incomplete_change_data`) and never weakens a deterministic BLOCK. A missing PR, bad credentials, a rate limit or an API outage stops the run with the reason.
+- **Live check:** `uv run python scripts/github_smoke.py --output <file>` compares fixture/PR pairs deterministically (no LLM calls). Two runs from 2026-11-23 are recorded:
+  - `evals/github/m2_live_smoke.json`, without scanners. Every PR ended at REVIEW, because the missing oasdiff and gitleaks are recorded as gaps instead of being read as clean scans.
+  - `evals/github/m2_live_smoke_tools.json`, with `tufin/oasdiff` and `zricethezav/gitleaks:v8.30.1`. There were no gaps, and two pairs matched their fixtures:
+    - seed PR 1 reached PASS 10, like CHG-H001;
+    - seed PR 8 reached BLOCK `critical-contract-break` from a real oasdiff ERR, like CHG-E002.
+
+    Two did not, and the cause is in the seed scenarios, not the pipeline:
+    - oasdiff rates seed PR 7's removed request property as WARN, not ERR, so it passes, while CHG-H002 blocks;
+    - gitleaks' default allowlists skip seed PR 10's `…EXAMPLE` AWS key, so it passes, while CHG-H003 blocks.
+
+  Seed PR 2 differs from CHG-E001 in blast radius because of a fixture inconsistency. Thresholds, scanner rules and expected labels were not changed to make these pairs match.
 
 ---
 

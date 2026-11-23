@@ -34,6 +34,7 @@ from app.deterministic.models import DeterministicSignals
 from app.deterministic.policy_gate import apply_policy_gate, strictest_decision
 from app.deterministic.risk_engine import compute_risk_score
 from app.graph.budget import BudgetExhaustedError
+from app.graph.change_signals import SIGNAL_TOOL_CALLS, signals_via_mcp
 from app.graph.context import AnalysisGraphContext
 from app.graph.evidence_context import build_verifier_evidence, chunk_records
 from app.graph.evidence_ids import evidence_id
@@ -145,9 +146,14 @@ def intake_validator(state: GraphState, config: RunnableConfig) -> dict[str, Any
     }
 
 
-def deterministic_signal_layer(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+INCOMPLETE_CHANGE_DATA = "incomplete_change_data"
+
+
+async def deterministic_signal_layer(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     ctx = _ctx(config)
     request = _request(state)
+    if request.source != "fixture":
+        return await _live_signal_layer(ctx, request)
     fixture_dir = resolve_fixture(
         request.change_id,
         pack_id=request.domain_pack_id,
@@ -168,6 +174,29 @@ def deterministic_signal_layer(state: GraphState, config: RunnableConfig) -> dic
         "deterministic_signals": signals.model_dump(mode="json"),
         "changed_files": list(manifest.changed_files),
     }
+
+
+async def _live_signal_layer(ctx: AnalysisGraphContext, request: AnalysisRequest) -> dict[str, Any]:
+    """Signals for a live source, fetched through the MCP client like agent data.
+
+    Missing data (unscanned files, an uncomputed contract diff, truncated file lists)
+    degrades the run to REVIEW before any LLM call; a deterministic BLOCK still holds.
+    """
+    collected = await signals_via_mcp(
+        ctx.mcp,
+        change_id=request.change_id,
+        domain_pack_id=request.domain_pack_id,
+    )
+    ctx.trace.mcp_tool_calls += SIGNAL_TOOL_CALLS
+    update: dict[str, Any] = {
+        "deterministic_signals": collected.signals.model_dump(mode="json"),
+        "changed_files": collected.changed_files,
+        **_trace_update(ctx),
+    }
+    if collected.gaps:
+        update["degraded_to_review"] = True
+        update["errors"] = [f"{INCOMPLETE_CHANGE_DATA}: {gap}" for gap in collected.gaps]
+    return update
 
 
 def triage_change_summary(signals: DeterministicSignals | None, changed_files: list[str]) -> str:
@@ -614,14 +643,23 @@ def _degraded_decision(computed: ReleaseDecision) -> ReleaseDecision:
     return strictest_decision(computed, ReleaseDecision.REVIEW)
 
 
+def _degrade_reason(state: GraphState) -> str:
+    """Audit label for a degraded run: incomplete source data, else budget/recursion."""
+    errors = state.get("errors") or []
+    if any(str(error).startswith(f"{INCOMPLETE_CHANGE_DATA}:") for error in errors):
+        return INCOMPLETE_CHANGE_DATA
+    return "budget_or_recursion"
+
+
 def degrade_review_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     ctx = _ctx(config)
+    reason = _degrade_reason(state)
     existing = state.get("risk_assessment")
     if existing:
         patched = {
             **existing,
             "decision": _degraded_decision(ReleaseDecision(existing["decision"])).value,
-            "override_applied": existing.get("override_applied") or "budget_or_recursion",
+            "override_applied": existing.get("override_applied") or reason,
         }
         return {"risk_assessment": patched, "degraded_to_review": True}
 
@@ -631,7 +669,7 @@ def degrade_review_node(state: GraphState, config: RunnableConfig) -> dict[str, 
             risk_score=100,
             decision=ReleaseDecision.REVIEW,
             confidence=0.0,
-            override_applied="budget_or_recursion",
+            override_applied=reason,
         )
         return {"risk_assessment": assessment.model_dump(mode="json"), "degraded_to_review": True}
 
@@ -641,7 +679,7 @@ def degrade_review_node(state: GraphState, config: RunnableConfig) -> dict[str, 
         risk_score=gate.risk_score,
         decision=_degraded_decision(ReleaseDecision(gate.decision)),
         confidence=0.5,
-        override_applied=gate.override_applied or "budget_or_recursion",
+        override_applied=gate.override_applied or reason,
         overrides_matched=list(gate.overrides_matched),
         component_scores=risk.weighted_components,
     )

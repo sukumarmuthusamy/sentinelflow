@@ -61,14 +61,16 @@ class TestGetChangePackage:
             )
             assert "path" in message.lower() or "invalid" in message.lower()
 
-    async def test_github_source_stubbed(self) -> None:
+    async def test_github_source_requires_pr_id(self) -> None:
+        # Live GitHub behaviour is covered in test_github_source.py; a fixture id is
+        # rejected before any request is made.
         async with mcp_session() as adapter:
             message = await _tool_error(
                 adapter,
                 "get_change_package",
                 {"change_id": "CHG-H001", "source": "github"},
             )
-            assert "deferred" in message.lower() or "github" in message.lower()
+            assert "PR-<number>" in message
 
 
 class TestGetDependencyGraph:
