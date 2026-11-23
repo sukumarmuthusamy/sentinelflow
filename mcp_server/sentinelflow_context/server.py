@@ -41,7 +41,7 @@ def get_change_package(
     domain_pack_id: str | None = None,
     source: str = "fixture",
 ) -> ChangePackageResponse:
-    """Load a change package from fixtures or the deferred GitHub integration."""
+    """Load a change package from a fixture or a GitHub pull request (read-only)."""
     settings = get_mcp_server_settings()
     return services.get_change_package(
         settings,
@@ -55,6 +55,7 @@ def get_change_package(
 def get_dependency_graph(
     change_id: str,
     domain_pack_id: str | None = None,
+    source: str = "fixture",
 ) -> DependencyGraphResponse:
     """Return the provenance-tagged dependency graph and blast radius for a change."""
     settings = get_mcp_server_settings()
@@ -62,6 +63,7 @@ def get_dependency_graph(
         settings,
         change_id=validate_change_id(change_id),
         domain_pack_id=validate_domain_pack_id(domain_pack_id) if domain_pack_id else None,
+        source=validate_source(source),
     )
 
 
@@ -70,14 +72,16 @@ def diff_contracts(
     change_id: str,
     domain_pack_id: str | None = None,
     fixture_only: bool = True,
+    source: str = "fixture",
 ) -> ContractDiffToolResponse:
-    """Diff OpenAPI contracts for a fixture change via oasdiff or fixture signals."""
+    """Diff OpenAPI contracts for a change (fixture signals, or oasdiff for GitHub)."""
     settings = get_mcp_server_settings()
     return services.diff_contracts(
         settings,
         change_id=validate_change_id(change_id),
         domain_pack_id=validate_domain_pack_id(domain_pack_id) if domain_pack_id else None,
         fixture_only=fixture_only,
+        source=validate_source(source),
     )
 
 
@@ -85,13 +89,15 @@ def diff_contracts(
 def list_tests(
     change_id: str,
     domain_pack_id: str | None = None,
+    source: str = "fixture",
 ) -> ChangeTestInventory:
-    """List required and available tests for a fixture change."""
+    """List required and available tests for a change."""
     settings = get_mcp_server_settings()
     return services.list_tests(
         settings,
         change_id=validate_change_id(change_id),
         domain_pack_id=validate_domain_pack_id(domain_pack_id) if domain_pack_id else None,
+        source=validate_source(source),
     )
 
 
@@ -101,6 +107,7 @@ def run_tests(
     test_ids: list[str],
     domain_pack_id: str | None = None,
     dry_run: bool = True,
+    source: str = "fixture",
 ) -> RunTestsResponse:
     """Plan or defer sandboxed test execution for allowlisted tests."""
     settings = get_mcp_server_settings()
@@ -110,6 +117,7 @@ def run_tests(
         test_ids=validate_test_ids(test_ids),
         domain_pack_id=validate_domain_pack_id(domain_pack_id) if domain_pack_id else None,
         dry_run=dry_run,
+        source=validate_source(source),
     )
 
 
@@ -118,14 +126,16 @@ def run_security_scan(
     change_id: str,
     domain_pack_id: str | None = None,
     fixture_only: bool = True,
+    source: str = "fixture",
 ) -> SecurityScanToolResponse:
-    """Run gitleaks, semgrep, and osv-scanner wrappers for a fixture change."""
+    """Security scan for a change (fixture signals, or gitleaks for GitHub)."""
     settings = get_mcp_server_settings()
     return services.run_security_scan(
         settings,
         change_id=validate_change_id(change_id),
         domain_pack_id=validate_domain_pack_id(domain_pack_id) if domain_pack_id else None,
         fixture_only=fixture_only,
+        source=validate_source(source),
     )
 
 

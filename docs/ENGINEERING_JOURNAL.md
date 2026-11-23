@@ -305,3 +305,26 @@ This is the first live run on the hardened graph: commit `a6636e6`, prompts v3, 
 - Tool-derived assertions (contract diff, scanner output, blast radius) should be verifiable against the deterministic signals that produced them, rather than counted as unsupported prose.
 - The doc-only blast-radius attribution needs a deterministic fix.
 - Until then, a documentation change cannot reach PASS on this corpus, so PASS recall is unmeasured.
+
+## M2 GitHub source: the stub hid a second bypass, and missing scanners read as clean
+
+**What looked wrong.** M2 was marked complete, but `get_change_package(source="github")` raised a `ToolError` stub. The exit criterion ("the same scenario runs identically against a fixture and against a real GitHub PR") had never been exercised.
+
+**Investigation.**
+
+- *Boundary.* Agents read change data through the MCP client. The graph's `deterministic_signal_layer` does not: it reads the fixture directory from disk. For fixtures that is harmless, but a live source has no directory, so replacing the stub alone would not have been enough.
+- *Fail-open tools.* The M1 scanner wrappers return an empty `SecurityScanResult` when gitleaks or semgrep is not installed, or when a run fails, and that result cannot be told apart from a clean scan. Fixture mode never hits this because it reads recorded signals. A live PR would have passed a secret change on any machine without gitleaks.
+- *oasdiff parsing.* `oasdiff breaking --format json` encodes `level` as an integer (3 = ERR). The parser upper-cased the value and mapped anything it did not recognize to INFO, so a real breaking change would have scored as non-breaking. Fixture mode reads recorded JSON with string levels, so this never showed.
+
+**Root cause.** GitHub mode was deferred until a seed repository existed. In the meantime, the fixture-only path made every live-tool assumption untestable.
+
+**Decision.**
+
+- GitHub PRs are read inside `sentinelflow-context` with GET-only REST calls and normalized into the fixture shape ([ADR-0002](adr/0002-github-change-source.md)). Each pack's `live_source.yaml` names the repository and the path-to-service rules. The runner pins `source` on change-scoped MCP calls, so no agent code changed. For live sources, the deterministic node builds its signals from the same five MCP tools the agents use. A test checks that, for all eight fixtures, this produces exactly the signals of the on-disk path.
+- The GitHub path has its own fail-closed wrappers: a missing tool or a non-zero exit returns "unavailable", and the change data records that as a gap. Gaps degrade the run to REVIEW before any LLM call and never weaken a BLOCK. Images are never pulled implicitly. gitleaks output is redacted.
+- The oasdiff parser now maps numeric levels. This is a fix to shared M1 code, but fixture mode is unaffected because it reads recorded JSON. The mapping comes from oasdiff's documented output and has not yet been checked against a real oasdiff run on this machine.
+- Thresholds, weights and labels were left unchanged.
+
+**Live result (2026-11-23, read-only, no token).** Seed PRs 1, 7, 2 and 8 normalized to the same primary services as CHG-H001, CHG-H002, CHG-E001 and CHG-E002. Every PR ended at REVIEW because neither oasdiff nor gitleaks is installed here. CHG-E001 and seed PR 2 also differ in blast radius: the fixture starts its docs change at `svc-inventory`, while the H001 convention, which GitHub mode follows, starts a non-code file at the file. That fixture inconsistency is recorded for M6 and not changed here.
+
+Tests: `tests/contract/test_github_source.py`, `tests/graph/test_github_change_source.py`, `tests/unit/test_github_signal_tools.py`.

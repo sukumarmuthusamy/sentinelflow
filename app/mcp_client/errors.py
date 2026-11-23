@@ -34,3 +34,11 @@ class McpProtocolError(Exception):
 def map_protocol_error(exc: MCPError) -> McpProtocolError:
     """Convert SDK MCPError into the adapter's protocol error type."""
     return McpProtocolError(message=str(exc), code=getattr(exc, "code", None))
+
+
+class ChangeSourceError(RuntimeError):
+    """The change source could not supply a change (missing PR, auth, rate limit, outage).
+
+    A RuntimeError so LangGraph's node retry does not re-issue the same failing request:
+    the run stops and the reason is reported instead.
+    """

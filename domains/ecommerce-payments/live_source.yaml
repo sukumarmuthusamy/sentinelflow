@@ -1,0 +1,16 @@
+# Live change source for this pack (read-only). Used only when an analysis
+# request sets source=github; fixture mode never reads this file.
+github:
+  repository: sukumarmuthusamy/sentinelflow-demo-platform
+  # Changed paths are attributed to services by these rules. An entry ending in
+  # "/" is a directory prefix; anything else must match the path exactly.
+  services:
+    - service: svc-payment-api
+      paths: [services/svc_payment_api/, tests/test_payment_api.py]
+      contracts: [contracts/svc-payment-api.yaml]
+    - service: svc-inventory
+      paths: [services/svc_inventory/, docs/inventory-guide.md, tests/test_inventory.py]
+      contracts: [contracts/svc-inventory.yaml]
+    - service: svc-order-events
+      paths: [services/svc_order_events/, tests/test_order_events.py]
+      contracts: [contracts/svc-order-events.yaml]

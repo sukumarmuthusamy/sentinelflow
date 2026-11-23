@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -18,6 +18,11 @@ class McpServerSettings:
     domains_root: Path
     default_domain_pack_id: str
     audit_log_path: Path
+    # GitHub change source (read-only). The token is optional: public repositories
+    # are readable without one. It is excluded from repr so it never reaches logs.
+    github_api_url: str = "https://api.github.com"
+    github_token: str | None = field(default=None, repr=False)
+    github_timeout_seconds: float = 15.0
 
 
 @lru_cache
@@ -34,6 +39,7 @@ def get_mcp_server_settings() -> McpServerSettings:
             domains_root=app_settings.domains_root,
         ),
         audit_log_path=audit_log_path,
+        github_token=os.getenv("SENTINELFLOW_GITHUB_TOKEN") or None,
     )
 
 

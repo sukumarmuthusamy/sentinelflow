@@ -78,7 +78,8 @@ class ContractChange(BaseModel):
 class ContractDiffResult(BaseModel):
     """Severity-graded OpenAPI/Protobuf compatibility verdict."""
 
-    tool: Literal["oasdiff", "buf", "fixture", "unavailable"] = "unavailable"
+    # "not_applicable": the change touched no contract file, so nothing was diffed.
+    tool: Literal["oasdiff", "buf", "fixture", "unavailable", "not_applicable"] = "unavailable"
     err_count: int = Field(default=0, ge=0)
     warn_count: int = Field(default=0, ge=0)
     info_count: int = Field(default=0, ge=0)

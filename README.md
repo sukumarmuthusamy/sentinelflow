@@ -8,12 +8,12 @@ SentinelFlow ingests a proposed software change and produces an **evidence-cited
 |---|---|---|
 | **M0** | Complete | Typed contracts, FastAPI skeleton, domain-pack loader, CI (ruff, mypy, pytest) |
 | **M1** | Complete | Deterministic signal layer: import graph, blast radius, oasdiff/buf, security scanners, risk engine, policy gate |
-| **M2** | Complete | `sentinelflow-context` MCP server (7 tools, 3 resources), typed client adapter |
+| **M2** | Complete | `sentinelflow-context` MCP server (7 tools, 3 resources), typed client adapter, read-only GitHub PR change source behind the same tools |
 | **M3** | Complete | Hybrid RAG, pgvector + Qdrant adapters, Gemini embeddings, reranker ablation (none vs Voyage), eval harness |
-| **M4** | In review | LangGraph workflow, five agents, triage planner, checkpoint + approval interrupt. A post-hardening live check ran on an OpenRouter stand-in model across 4 fixtures: both expected BLOCKs held, the 2 expected PASS fixtures returned REVIEW, and 0 invalid citations survived. Evidence coverage was 0% on the templated corpus. The primary Gemini model is not yet evaluated |
+| **M4** | Complete (merged in #1) | LangGraph workflow, five agents, triage planner, checkpoint + approval interrupt. A post-hardening live check ran on an OpenRouter stand-in model across 4 fixtures: both expected BLOCKs held, the 2 expected PASS fixtures returned REVIEW, and 0 invalid citations survived. Evidence coverage was 0% on the templated corpus. The primary Gemini model is not yet evaluated |
 
 Canonical architecture and roadmap: [SENTINELFLOW_PLAN.md](SENTINELFLOW_PLAN.md).  
-Real obstacles and tradeoffs from M0–M3: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
+Real obstacles and tradeoffs from M0–M4: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
 
 ---
 
@@ -176,12 +176,14 @@ python scripts/verify_mcp_inspector.py
 
 | Tool | Status |
 |---|---|
-| `get_change_package` | **Fixture mode:** reads `manifest.yaml` under `domains/<pack>/fixtures/changes/`. **GitHub mode:** stubbed with explicit `ToolError` (deferred — plan section 15). |
+| `get_change_package` | **Fixture mode:** reads `manifest.yaml` under `domains/<pack>/fixtures/changes/`. **GitHub mode:** normalizes a pull request (see below). |
 | `get_dependency_graph` | Fully wired to M1 `dependency_graph.py` |
-| `diff_contracts` | Fully wired to M1 `contract_diff.py` (fixture signals by default) |
-| `list_tests` | Reads fixture manifest test inventory |
-| `run_tests` | **Dry-run:** returns planned execution + hardened docker flags. **Live execution:** deferred to M7. |
-| `run_security_scan` | Fully wired to M1 `security_scanners.py` (fixture signals by default) |
+| `diff_contracts` | Fully wired to M1 `contract_diff.py` (fixture signals by default; oasdiff on base/head in GitHub mode) |
+| `list_tests` | Reads fixture manifest test inventory (empty in GitHub mode) |
+| `run_tests` | **Dry-run:** returns planned execution + hardened docker flags. **Live execution:** deferred to M7. Refused in GitHub mode. |
+| `run_security_scan` | Fully wired to M1 `security_scanners.py` (fixture signals by default; gitleaks on the PR head in GitHub mode) |
+
+Every change-scoped tool takes `source` (`fixture` by default, or `github`).
 | `record_gate_decision` | Append-only JSONL audit log with idempotency key |
 
 ### Resources
@@ -204,6 +206,17 @@ async with SentinelFlowMcpAdapter(mcp) as client:
 ```
 
 Business/validation failures surface as `ToolError` (`is_error=True` on the wire). Protocol failures map to `McpProtocolError`.
+
+### GitHub change source
+
+`AnalysisRequest(source="github", change_id="PR-7", domain_pack_id=...)` analyses a pull request instead of a fixture ([ADR-0002](docs/adr/0002-github-change-source.md)). Agents are unchanged: the runner pins `source` on every change-scoped MCP call, so a run cannot mix sources and agents never choose where data comes from.
+
+- **Configuration.** The repository and the path-to-service rules come from `domains/<pack>/live_source.yaml`, never from tool input. Both packs point at the synthetic seed repo `sukumarmuthusamy/sentinelflow-demo-platform`.
+- **Access.** GET requests to the GitHub REST API only. `SENTINELFLOW_GITHUB_TOKEN` is optional; for private repos use a fine-grained token with read-only *Pull requests* and *Contents* access. The token is never logged or echoed in errors.
+- **Normalization.** Same `ChangePackageResponse` as fixtures. A code file originates at its owning service and a non-code file at the file itself, as in the fixtures. The PR title is sanitized and kept out of agent input; the body is not stored.
+- **Signals.** oasdiff runs on the base and head versions of each changed contract, and gitleaks runs on the head version of each changed file. Both run from PATH or a local Docker image (`--pull=never`, no network). The test inventory is empty and semgrep is not run; both are reported as notes.
+- **Incomplete data degrades.** A missing tool, an unreadable or oversized file, a truncated file list, an unattributed code file or a changed dependency manifest is recorded in `gaps`. The run then degrades to REVIEW before any LLM call (`override_applied = incomplete_change_data`) and never weakens a deterministic BLOCK. A missing PR, bad credentials, a rate limit or an API outage stops the run with the reason.
+- **Live check:** `uv run python scripts/github_smoke.py --output evals/github/m2_live_smoke.json` compares fixture/PR pairs deterministically (no LLM calls). Results from 2026-11-23 are in `evals/github/m2_live_smoke.json`. All four PRs normalized to the same primary service as their fixtures, and three of the four also matched on blast radius. Every PR ended at REVIEW because neither oasdiff nor gitleaks was installed locally, and the script records both as gaps instead of treating the scan as clean. Offline tests on recorded API responses show seed PR 1 reaching the same PASS as CHG-H001, and seed PR 7 reaching the same BLOCK as CHG-H002 when given a scripted oasdiff ERR.
 
 ---
 

@@ -21,6 +21,10 @@ from app.graph.state import ReleaseDecision
 from mcp.server.mcpserver.exceptions import ToolError
 
 from mcp_server.sentinelflow_context.audit_log import record_gate_decision
+from mcp_server.sentinelflow_context.github_source import (
+    github_dependency_graph,
+    resolve_github_change,
+)
 from mcp_server.sentinelflow_context.models import (
     ChangePackageResponse,
     ChangeTestInventory,
@@ -46,10 +50,8 @@ SANDBOX_DOCKER_FLAGS = [
     "--user=nobody",
 ]
 
-GITHUB_CHANGE_SOURCE_TODO = (
-    "Live GitHub change packages are deferred until a seeded public repository is "
-    "available (see SENTINELFLOW_PLAN.md section 15, open question 3). Use "
-    "source='fixture' for now."
+GITHUB_RUN_TESTS_UNSUPPORTED = (
+    "GitHub mode has no test inventory, so there are no allowlisted tests to plan."
 )
 
 
@@ -90,9 +92,10 @@ def get_change_package(
     domain_pack_id: str | None = None,
     source: str = "fixture",
 ) -> ChangePackageResponse:
-    """Load a change package from fixtures or stub the GitHub path."""
+    """Load a change package from a fixture or a GitHub pull request."""
     if source == "github":
-        raise ToolError(GITHUB_CHANGE_SOURCE_TODO)
+        pack = _load_pack(settings, domain_pack_id)
+        return resolve_github_change(settings, pack=pack, change_id=change_id).package
 
     fixture_dir, pack = _resolve_fixture(
         settings,
@@ -118,8 +121,13 @@ def get_dependency_graph(
     *,
     change_id: str,
     domain_pack_id: str | None = None,
+    source: str = "fixture",
 ) -> DependencyGraphResponse:
-    """Build the dependency graph and blast radius for a fixture change."""
+    """Build the dependency graph and blast radius for a change."""
+    if source == "github":
+        pack = _load_pack(settings, domain_pack_id)
+        resolved = resolve_github_change(settings, pack=pack, change_id=change_id)
+        return github_dependency_graph(resolved, pack)
     fixture_dir, pack = _resolve_fixture(
         settings,
         change_id=change_id,
@@ -162,8 +170,17 @@ def diff_contracts(
     change_id: str,
     domain_pack_id: str | None = None,
     fixture_only: bool = True,
+    source: str = "fixture",
 ) -> ContractDiffToolResponse:
-    """Run contract diff for a fixture change."""
+    """Contract diff for a change (fixture signals, or oasdiff on base/head for GitHub)."""
+    if source == "github":
+        pack = _load_pack(settings, domain_pack_id)
+        resolved = resolve_github_change(settings, pack=pack, change_id=change_id)
+        return ContractDiffToolResponse(
+            change_id=change_id,
+            domain_pack_id=pack.pack_id,
+            result=resolved.contract_diff,
+        )
     fixture_dir, pack = _resolve_fixture(
         settings,
         change_id=change_id,
@@ -199,8 +216,14 @@ def list_tests(
     *,
     change_id: str,
     domain_pack_id: str | None = None,
+    source: str = "fixture",
 ) -> ChangeTestInventory:
-    """Return required and available tests for a fixture change."""
+    """Return required and available tests for a change."""
+    if source == "github":
+        # Resolve first so an unknown PR fails here instead of returning an empty list.
+        pack = _load_pack(settings, domain_pack_id)
+        resolve_github_change(settings, pack=pack, change_id=change_id)
+        return ChangeTestInventory(change_id=change_id, domain_pack_id=pack.pack_id)
     fixture_dir, pack = _resolve_fixture(
         settings,
         change_id=change_id,
@@ -234,8 +257,11 @@ def run_tests(
     test_ids: list[str],
     domain_pack_id: str | None = None,
     dry_run: bool = True,
+    source: str = "fixture",
 ) -> RunTestsResponse:
     """Dry-run test execution by default; live sandbox deferred to M7."""
+    if source == "github":
+        raise ToolError(GITHUB_RUN_TESTS_UNSUPPORTED)
     fixture_dir, pack = _resolve_fixture(
         settings,
         change_id=change_id,
@@ -286,8 +312,17 @@ def run_security_scan(
     change_id: str,
     domain_pack_id: str | None = None,
     fixture_only: bool = True,
+    source: str = "fixture",
 ) -> SecurityScanToolResponse:
-    """Run security scanners for a fixture change."""
+    """Security scan for a change (fixture signals, or gitleaks on the PR head)."""
+    if source == "github":
+        pack = _load_pack(settings, domain_pack_id)
+        resolved = resolve_github_change(settings, pack=pack, change_id=change_id)
+        return SecurityScanToolResponse(
+            change_id=change_id,
+            domain_pack_id=pack.pack_id,
+            result=resolved.security,
+        )
     fixture_dir, pack = _resolve_fixture(
         settings,
         change_id=change_id,

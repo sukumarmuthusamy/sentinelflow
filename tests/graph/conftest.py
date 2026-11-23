@@ -55,6 +55,7 @@ def run_graph(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, audit_log_path: P
         retriever: Any = _DEFAULT,
         wrap_mcp: Callable[[Any], Any] | None = None,
         record_decision: bool = False,
+        source: str = "fixture",
     ) -> dict[str, Any]:
         from app.core.settings import get_settings
         from app.graph.runner import run_analysis
@@ -68,6 +69,7 @@ def run_graph(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, audit_log_path: P
             change_id=change_id,
             domain_pack_id=pack_id,
             record_decision=record_decision,
+            source=source,
         )
         chosen = FakeRetriever(DEFAULT_CHUNKS) if retriever is _DEFAULT else retriever
         try:

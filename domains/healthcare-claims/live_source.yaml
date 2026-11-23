@@ -1,0 +1,16 @@
+# Live change source for this pack (read-only). Used only when an analysis
+# request sets source=github; fixture mode never reads this file.
+github:
+  repository: sukumarmuthusamy/sentinelflow-demo-platform
+  # Changed paths are attributed to services by these rules. An entry ending in
+  # "/" is a directory prefix; anything else must match the path exactly.
+  services:
+    - service: svc-core-api
+      paths: [services/svc_core_api/, tests/test_core_api.py]
+      contracts: [contracts/svc-core-api.yaml]
+    - service: svc-notification
+      paths: [services/svc_notification/, tests/test_notification.py]
+      contracts: [contracts/svc-notification.yaml]
+    - service: svc-analytics
+      paths: [services/svc_analytics/, analytics_docs/, tests/test_analytics.py]
+      contracts: [contracts/svc-analytics.yaml]

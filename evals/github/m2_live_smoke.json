@@ -1,0 +1,299 @@
+{
+  "generated_at": "2026-11-23T09:31:32Z",
+  "mode": "read-only GitHub REST, deterministic signals only, no LLM calls",
+  "pairs": [
+    {
+      "pack": "healthcare-claims",
+      "fixture": {
+        "change_id": "CHG-H001",
+        "changed_files": [
+          "analytics_docs/readme.py"
+        ],
+        "primary_service": "svc-analytics",
+        "impacted_services": [
+          "svc-analytics"
+        ],
+        "blast_radius": {
+          "origin_nodes": [
+            "analytics_docs/readme.py"
+          ],
+          "affected_nodes": [],
+          "max_depth": 0,
+          "resolved_edge_count": 0,
+          "heuristic_edge_count": 0
+        },
+        "computed_decision": "PASS",
+        "decision": "PASS",
+        "risk_score": 10,
+        "override_applied": null,
+        "contract_tool": "fixture",
+        "contract_err_count": 0,
+        "secret_findings": 0
+      },
+      "pull_request": {
+        "change_id": "PR-1",
+        "head_sha": "553443d050718b0bc334eace4a32c1bf88708a32",
+        "base_sha": "e161b07e02c445f322a6124216e30229625c2919",
+        "changed_files": [
+          "analytics_docs/readme.py"
+        ],
+        "origin_nodes": [
+          "analytics_docs/readme.py"
+        ],
+        "primary_service": "svc-analytics",
+        "impacted_services": [
+          "svc-analytics"
+        ],
+        "blast_radius": {
+          "origin_nodes": [
+            "analytics_docs/readme.py"
+          ],
+          "affected_nodes": [],
+          "max_depth": 0,
+          "resolved_edge_count": 0,
+          "heuristic_edge_count": 0
+        },
+        "computed_decision": "PASS",
+        "decision": "REVIEW",
+        "risk_score": 10,
+        "override_applied": null,
+        "contract_tool": "not_applicable",
+        "contract_err_count": 0,
+        "secret_findings": 0,
+        "gaps": [
+          "gitleaks unavailable; changed files were not scanned for secrets"
+        ],
+        "notes": [
+          "Test inventory is not derived in GitHub mode: required_tests and available_tests are empty, so the test-gap term contributes 0.",
+          "semgrep SAST is not run in GitHub mode; secret scanning (gitleaks) is."
+        ]
+      },
+      "same": {
+        "primary_service": true,
+        "impacted_services": true,
+        "blast_radius": true
+      }
+    },
+    {
+      "pack": "healthcare-claims",
+      "fixture": {
+        "change_id": "CHG-H002",
+        "changed_files": [],
+        "primary_service": "svc-core-api",
+        "impacted_services": [
+          "svc-core-api"
+        ],
+        "blast_radius": {
+          "origin_nodes": [
+            "svc-core-api"
+          ],
+          "affected_nodes": [],
+          "max_depth": 0,
+          "resolved_edge_count": 0,
+          "heuristic_edge_count": 0
+        },
+        "computed_decision": "BLOCK",
+        "decision": "BLOCK",
+        "risk_score": 35,
+        "override_applied": "critical-contract-break",
+        "contract_tool": "fixture",
+        "contract_err_count": 1,
+        "secret_findings": 0
+      },
+      "pull_request": {
+        "change_id": "PR-7",
+        "head_sha": "79454b672393b01cd1ee0799b8e3ac72a1ca01b8",
+        "base_sha": "e161b07e02c445f322a6124216e30229625c2919",
+        "changed_files": [
+          "contracts/svc-core-api.yaml"
+        ],
+        "origin_nodes": [
+          "svc-core-api"
+        ],
+        "primary_service": "svc-core-api",
+        "impacted_services": [
+          "svc-core-api"
+        ],
+        "blast_radius": {
+          "origin_nodes": [
+            "svc-core-api"
+          ],
+          "affected_nodes": [],
+          "max_depth": 0,
+          "resolved_edge_count": 0,
+          "heuristic_edge_count": 0
+        },
+        "computed_decision": "PASS",
+        "decision": "REVIEW",
+        "risk_score": 20,
+        "override_applied": null,
+        "contract_tool": "unavailable",
+        "contract_err_count": 0,
+        "secret_findings": 0,
+        "gaps": [
+          "oasdiff unavailable; compatibility of contract 'contracts/svc-core-api.yaml' not computed",
+          "gitleaks unavailable; changed files were not scanned for secrets"
+        ],
+        "notes": [
+          "Test inventory is not derived in GitHub mode: required_tests and available_tests are empty, so the test-gap term contributes 0.",
+          "semgrep SAST is not run in GitHub mode; secret scanning (gitleaks) is."
+        ]
+      },
+      "same": {
+        "primary_service": true,
+        "impacted_services": true,
+        "blast_radius": true
+      }
+    },
+    {
+      "pack": "ecommerce-payments",
+      "fixture": {
+        "change_id": "CHG-E001",
+        "changed_files": [
+          "docs/inventory/README.md"
+        ],
+        "primary_service": "svc-inventory",
+        "impacted_services": [
+          "svc-inventory",
+          "svc-payment-api"
+        ],
+        "blast_radius": {
+          "origin_nodes": [
+            "svc-inventory"
+          ],
+          "affected_nodes": [
+            {
+              "node_id": "svc-payment-api",
+              "depth": 1,
+              "provenance": "seed"
+            }
+          ],
+          "max_depth": 1,
+          "resolved_edge_count": 0,
+          "heuristic_edge_count": 1
+        },
+        "computed_decision": "PASS",
+        "decision": "PASS",
+        "risk_score": 38,
+        "override_applied": null,
+        "contract_tool": "fixture",
+        "contract_err_count": 0,
+        "secret_findings": 0
+      },
+      "pull_request": {
+        "change_id": "PR-2",
+        "head_sha": "915e00f1bf71153ca6dae05be30ab7d92396df00",
+        "base_sha": "e161b07e02c445f322a6124216e30229625c2919",
+        "changed_files": [
+          "docs/inventory-guide.md"
+        ],
+        "origin_nodes": [
+          "docs/inventory-guide.md"
+        ],
+        "primary_service": "svc-inventory",
+        "impacted_services": [
+          "svc-inventory"
+        ],
+        "blast_radius": {
+          "origin_nodes": [
+            "docs/inventory-guide.md"
+          ],
+          "affected_nodes": [],
+          "max_depth": 0,
+          "resolved_edge_count": 0,
+          "heuristic_edge_count": 0
+        },
+        "computed_decision": "PASS",
+        "decision": "REVIEW",
+        "risk_score": 15,
+        "override_applied": null,
+        "contract_tool": "not_applicable",
+        "contract_err_count": 0,
+        "secret_findings": 0,
+        "gaps": [
+          "gitleaks unavailable; changed files were not scanned for secrets"
+        ],
+        "notes": [
+          "Test inventory is not derived in GitHub mode: required_tests and available_tests are empty, so the test-gap term contributes 0.",
+          "semgrep SAST is not run in GitHub mode; secret scanning (gitleaks) is."
+        ]
+      },
+      "same": {
+        "primary_service": true,
+        "impacted_services": false,
+        "blast_radius": false
+      }
+    },
+    {
+      "pack": "ecommerce-payments",
+      "fixture": {
+        "change_id": "CHG-E002",
+        "changed_files": [],
+        "primary_service": "svc-payment-api",
+        "impacted_services": [
+          "svc-payment-api"
+        ],
+        "blast_radius": {
+          "origin_nodes": [
+            "svc-payment-api"
+          ],
+          "affected_nodes": [],
+          "max_depth": 0,
+          "resolved_edge_count": 0,
+          "heuristic_edge_count": 0
+        },
+        "computed_decision": "BLOCK",
+        "decision": "BLOCK",
+        "risk_score": 35,
+        "override_applied": "critical-contract-break",
+        "contract_tool": "fixture",
+        "contract_err_count": 1,
+        "secret_findings": 0
+      },
+      "pull_request": {
+        "change_id": "PR-8",
+        "head_sha": "ea7a79c9b5a63ab4c85bb08955a2c7eff26bae61",
+        "base_sha": "e161b07e02c445f322a6124216e30229625c2919",
+        "changed_files": [
+          "contracts/svc-payment-api.yaml"
+        ],
+        "origin_nodes": [
+          "svc-payment-api"
+        ],
+        "primary_service": "svc-payment-api",
+        "impacted_services": [
+          "svc-payment-api"
+        ],
+        "blast_radius": {
+          "origin_nodes": [
+            "svc-payment-api"
+          ],
+          "affected_nodes": [],
+          "max_depth": 0,
+          "resolved_edge_count": 0,
+          "heuristic_edge_count": 0
+        },
+        "computed_decision": "PASS",
+        "decision": "REVIEW",
+        "risk_score": 20,
+        "override_applied": null,
+        "contract_tool": "unavailable",
+        "contract_err_count": 0,
+        "secret_findings": 0,
+        "gaps": [
+          "oasdiff unavailable; compatibility of contract 'contracts/svc-payment-api.yaml' not computed",
+          "gitleaks unavailable; changed files were not scanned for secrets"
+        ],
+        "notes": [
+          "Test inventory is not derived in GitHub mode: required_tests and available_tests are empty, so the test-gap term contributes 0.",
+          "semgrep SAST is not run in GitHub mode; secret scanning (gitleaks) is."
+        ]
+      },
+      "same": {
+        "primary_service": true,
+        "impacted_services": true,
+        "blast_radius": true
+      }
+    }
+  ]
+}

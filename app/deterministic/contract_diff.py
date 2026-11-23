@@ -20,6 +20,14 @@ class OasDiffOptions(BaseModel):
     timeout_seconds: int = 120
 
 
+_OASDIFF_NUMERIC_LEVELS = {"3": "ERR", "2": "WARN", "1": "INFO"}
+
+
+def parse_oasdiff_output(stdout: str, stderr: str = "") -> ContractDiffResult:
+    """Parse ``oasdiff breaking --format json`` output (public alias)."""
+    return _parse_oasdiff_output(stdout, stderr)
+
+
 def _parse_oasdiff_output(stdout: str, stderr: str) -> ContractDiffResult:
     payload = stdout.strip() or stderr.strip()
     if not payload:
@@ -36,6 +44,8 @@ def _parse_oasdiff_output(stdout: str, stderr: str) -> ContractDiffResult:
             if not isinstance(item, dict):
                 continue
             level = str(item.get("level", item.get("severity", "INFO"))).upper()
+            # oasdiff's JSON encodes level as an integer (3=ERR, 2=WARN, 1=INFO).
+            level = _OASDIFF_NUMERIC_LEVELS.get(level, level)
             if level not in {"ERR", "WARN", "INFO"}:
                 level = "INFO"
             changes.append(
@@ -49,6 +59,7 @@ def _parse_oasdiff_output(stdout: str, stderr: str) -> ContractDiffResult:
         for item in parsed["changes"]:
             if isinstance(item, dict):
                 level = str(item.get("level", "INFO")).upper()
+                level = _OASDIFF_NUMERIC_LEVELS.get(level, level)
                 changes.append(
                     ContractChange(
                         level=level if level in {"ERR", "WARN", "INFO"} else "INFO",  # type: ignore[arg-type]

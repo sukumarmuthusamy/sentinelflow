@@ -1,0 +1,26 @@
+{
+  "number": 7,
+  "title": "feat(core-api)!: remove required member_id from claim submit contract",
+  "state": "open",
+  "draft": false,
+  "merged": false,
+  "body": "Synthetic demo PR for SentinelFlow live-mode evaluation.\r\n\r\nBranch: `pr/007-breaking-core-api-contract`\r\nGround truth: see `eval/pr-ground-truth.yaml`",
+  "changed_files": 1,
+  "additions": 2,
+  "deletions": 14,
+  "html_url": "https://github.com/sukumarmuthusamy/sentinelflow-demo-platform/pull/7",
+  "base": {
+    "ref": "main",
+    "sha": "e161b07e02c445f322a6124216e30229625c2919",
+    "repo": {
+      "full_name": "sukumarmuthusamy/sentinelflow-demo-platform"
+    }
+  },
+  "head": {
+    "ref": "pr/007-breaking-core-api-contract",
+    "sha": "79454b672393b01cd1ee0799b8e3ac72a1ca01b8",
+    "repo": {
+      "full_name": "sukumarmuthusamy/sentinelflow-demo-platform"
+    }
+  }
+}

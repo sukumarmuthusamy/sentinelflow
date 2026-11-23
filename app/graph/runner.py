@@ -19,6 +19,7 @@ from app.graph.context import AnalysisGraphContext, EvidenceRetriever
 from app.graph.state import AnalysisRequest
 from app.graph.typed_state import GraphState
 from app.mcp_client.port import McpClientPort
+from app.mcp_client.source_binding import bind_change_source
 from app.model_gateway.llm import StructuredLLM
 from app.rag.models import RerankerMode, VectorStoreBackend
 from app.rag.retrieval import RetrievalService
@@ -92,7 +93,8 @@ async def build_analysis_context(
         retrieval = owned
     context = AnalysisGraphContext(
         domain_pack=pack,
-        mcp=mcp,
+        # Every change-scoped tool call in this run reads from the request's source.
+        mcp=bind_change_source(mcp, request.source),
         llm=llm,
         budget=AnalysisBudget.from_settings(cfg),
         retrieval=retrieval,
