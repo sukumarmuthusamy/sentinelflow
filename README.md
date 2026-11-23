@@ -216,7 +216,17 @@ Business/validation failures surface as `ToolError` (`is_error=True` on the wire
 - **Normalization.** Same `ChangePackageResponse` as fixtures. A code file originates at its owning service and a non-code file at the file itself, as in the fixtures. The PR title is sanitized and kept out of agent input; the body is not stored.
 - **Signals.** oasdiff runs on the base and head versions of each changed contract, and gitleaks runs on the head version of each changed file. Both run from PATH or a local Docker image (`--pull=never`, no network). The test inventory is empty and semgrep is not run; both are reported as notes.
 - **Incomplete data degrades.** A missing tool, an unreadable or oversized file, a truncated file list, an unattributed code file or a changed dependency manifest is recorded in `gaps`. The run then degrades to REVIEW before any LLM call (`override_applied = incomplete_change_data`) and never weakens a deterministic BLOCK. A missing PR, bad credentials, a rate limit or an API outage stops the run with the reason.
-- **Live check:** `uv run python scripts/github_smoke.py --output evals/github/m2_live_smoke.json` compares fixture/PR pairs deterministically (no LLM calls). Results from 2026-11-23 are in `evals/github/m2_live_smoke.json`. All four PRs normalized to the same primary service as their fixtures, and three of the four also matched on blast radius. Every PR ended at REVIEW because neither oasdiff nor gitleaks was installed locally, and the script records both as gaps instead of treating the scan as clean. Offline tests on recorded API responses show seed PR 1 reaching the same PASS as CHG-H001, and seed PR 7 reaching the same BLOCK as CHG-H002 when given a scripted oasdiff ERR.
+- **Live check:** `uv run python scripts/github_smoke.py --output <file>` compares fixture/PR pairs deterministically (no LLM calls). Two runs from 2026-11-23 are recorded:
+  - `evals/github/m2_live_smoke.json`, without scanners. Every PR ended at REVIEW, because the missing oasdiff and gitleaks are recorded as gaps instead of being read as clean scans.
+  - `evals/github/m2_live_smoke_tools.json`, with `tufin/oasdiff` and `zricethezav/gitleaks:v8.30.1`. There were no gaps, and two pairs matched their fixtures:
+    - seed PR 1 reached PASS 10, like CHG-H001;
+    - seed PR 8 reached BLOCK `critical-contract-break` from a real oasdiff ERR, like CHG-E002.
+
+    Two did not, and the cause is in the seed scenarios, not the pipeline:
+    - oasdiff rates seed PR 7's removed request property as WARN, not ERR, so it passes, while CHG-H002 blocks;
+    - gitleaks' default allowlists skip seed PR 10's `…EXAMPLE` AWS key, so it passes, while CHG-H003 blocks.
+
+  Seed PR 2 differs from CHG-E001 in blast radius because of a fixture inconsistency. Thresholds, scanner rules and expected labels were not changed to make these pairs match.
 
 ---
 

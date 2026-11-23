@@ -328,3 +328,33 @@ This is the first live run on the hardened graph: commit `a6636e6`, prompts v3, 
 **Live result (2026-11-23, read-only, no token).** Seed PRs 1, 7, 2 and 8 normalized to the same primary services as CHG-H001, CHG-H002, CHG-E001 and CHG-E002. Every PR ended at REVIEW because neither oasdiff nor gitleaks is installed here. CHG-E001 and seed PR 2 also differ in blast radius: the fixture starts its docs change at `svc-inventory`, while the H001 convention, which GitHub mode follows, starts a non-code file at the file. That fixture inconsistency is recorded for M6 and not changed here.
 
 Tests: `tests/contract/test_github_source.py`, `tests/graph/test_github_change_source.py`, `tests/unit/test_github_signal_tools.py`.
+
+## M2 live run with real scanners: the pipeline holds, two seed scenarios do not trigger the tools
+
+**What looked wrong.** I reran the live smoke test with `tufin/oasdiff` (digest `e6afae33…`, build `059301e`) and `zricethezav/gitleaks:v8.30.1` (digest `c00b6bd0…`). Both ran in disposable containers with `--pull=never`, `--network=none` and a read-only input mount. No gaps were left, but only two of the four equivalent pairs matched their fixtures:
+
+- seed PR 1 matched CHG-H001 (PASS 10);
+- seed PR 8 matched CHG-E002 (BLOCK, `critical-contract-break`).
+
+Seed PR 7 and seed PR 10 both reached PASS, while their fixtures (CHG-H002 and CHG-H003) block.
+
+**Investigation.**
+
+- *PR 8.* Real oasdiff output encodes `level` as the integer 3, which confirms the numeric-level fix from the previous entry. Without that fix, this BLOCK would have been scored as non-breaking.
+- *PR 7.* oasdiff reports one `request-property-removed` change at level 2 (WARN). It also reports some INFO changes: `api-schema-removed`, `api-version-changed` and `response-non-success-status-removed`. None of them is an ERR, so `critical-contract-break` does not fire. The seed's ground truth says oasdiff should emit ERR, and for this diff it does not.
+- *PR 10.* gitleaks' trace log shows the seed's AWS key ending in `EXAMPLE` being skipped twice:
+  - the `aws-access-token` rule's allowlist (`.+EXAMPLE$`) drops it;
+  - the `generic-api-key` stopword `example` drops it.
+
+  The same container command does detect a randomly generated AWS-format key, and the output is redacted. Seed PRs 11 and 12 fail the same way: the global stopword `abcdefghijklmnopqrstuvwxyz` drops their token and key bodies, because those bodies contain sequential letters.
+
+**Root cause.** The seed scenarios were written with placeholder secrets and a contract change that the real tools classify as non-blocking. The fixtures recorded the intended verdicts rather than tool output. The pipeline is behaving correctly.
+
+**Decision.**
+
+- Nothing was changed to make the pairs match. Thresholds, gitleaks' default config, oasdiff's rules, the fixtures and the seed repository are all as they were.
+- Fixing these scenarios belongs in the seed repository: a secret that gitleaks' default rules detect, and a contract change that oasdiff rates ERR. That decision is the owner's, so it is recorded here and not made.
+
+A pre-existing labeling issue also surfaced. `dependency_vuln_at_or_above_ceiling` checks the overall `security.max_severity`. As a result, CHG-H003's critical secret is reported as `dependency-vuln-ceiling` rather than `secret-exposure`. The decision is the same, but the label is misleading. This is left for M6.
+
+Evidence: `evals/github/m2_live_smoke_tools.json`.

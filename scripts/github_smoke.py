@@ -34,6 +34,7 @@ from mcp_server.sentinelflow_context.server import mcp as server  # noqa: E402
 PAIRS = [
     ("healthcare-claims", "CHG-H001", "PR-1"),
     ("healthcare-claims", "CHG-H002", "PR-7"),
+    ("healthcare-claims", "CHG-H003", "PR-10"),
     ("ecommerce-payments", "CHG-E001", "PR-2"),
     ("ecommerce-payments", "CHG-E002", "PR-8"),
 ]
