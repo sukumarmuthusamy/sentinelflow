@@ -243,3 +243,65 @@ Tests: `tests/unit/test_policy_gate.py`, `tests/unit/test_grounding.py`, `tests/
   When verification did not run, coverage, assertion count and grounding fields are `null`, not zero. The default output is a new file, and the script refuses to overwrite an existing results file, so historical results cannot be replaced by accident.
 
 Tests: `tests/graph/test_budget_concurrency.py` (fails without the reservation), `tests/unit/test_budget.py`, `tests/graph/test_triage_failures.py`, `tests/unit/test_provider_errors.py`, `tests/graph/test_sample_result_summary.py`, `tests/graph/test_interrupt_resume.py`.
+
+## M4 post-hardening live validation: BLOCKs hold, and the corpus cannot support any assertion
+
+This is the first live run on the hardened graph: commit `a6636e6`, prompts v3, source-grounded verifier, no fixture labels in agent input. Earlier live results (`m4_sample_results*.json`) predate all of that and are not comparable as measures of decision quality.
+
+**Setup.**
+- Fixtures: four, from `evals/graph/m4_hardened_scenarios.jsonl`, one pass, on 2026-11-23.
+- Models: agents on `nvidia/nemotron-3.5-super-vl:free` (OpenRouter), triage on `gemini-3.5-flash-lite`, temperature 0.2.
+- Limits: default budgets (25 calls, 200k input and 50k output tokens), 4 parallel agents, 120 s node timeout, 3 transient retries on 5xx only.
+- Isolation: separate checkpoint and audit files. Results are in `evals/graph/m4_hardened_sample_results.json`.
+
+**Outcome.**
+
+| Fixture | Expected | Actual | Score | Deciding override | Matched overrides | Coverage | Calls (in/out tokens) |
+|---|---|---|---|---|---|---|---|
+| CHG-E003 | BLOCK | BLOCK | 42 | `dependency-vuln-ceiling` | dependency-vuln-ceiling, unsupported-critical-claim, weak-evidence | 0.0 | 7 (40,793 / 19,726) |
+| CHG-H001 | PASS | REVIEW | 20 | `weak-evidence` | weak-evidence | 0.0 | 6 (38,640 / 12,144) |
+| CHG-E001 | PASS | REVIEW | 48 | `weak-evidence` | weak-evidence | 0.0 | 6 (43,938 / 16,676) |
+| CHG-E002 | BLOCK | BLOCK | 45 | `critical-contract-break` | critical-contract-break, unsupported-critical-claim, weak-evidence | 0.0 | 8 (40,392 / 15,308) |
+
+**Provider usage and failures.**
+- 27 logical LLM calls, 0 failed. HTTP attempts matched exactly: 23 OpenRouter completions and 4 Gemini triage calls, all 200.
+- No retries and no 429/503. 20 new query embeddings; 11 queries were cache hits.
+- No degradation and no errors.
+
+**Gate integrity.**
+- CHG-E003 matched `weak-evidence` and `unsupported-critical-claim` (both REVIEW, listed first in `policy.yaml`) together with `dependency-vuln-ceiling`. The first-match gate would have returned REVIEW; strictest-wins returned BLOCK. This is the downgrade path fixed in the hardening pass, now exercised live.
+- CHG-E002:
+  - paused at the approval interrupt and resumed on the same checkpoint thread;
+  - wrote exactly one audit record, whose `analysis_id` matches the thread;
+  - kept its trace across the resume (8 calls, 40,392 input tokens, repair count 1 before and after).
+- CHG-E001 was triaged as `documentation` with three agents. It was misclassified as `api_contract` before its `changed_files` were added.
+- Citations: no invalid citation survived the filter. One invented ID (`none::none`, CHG-E003) was rejected before it reached the report.
+- No chunk was screened as instruction-like and the verifier raised no injection flags.
+
+**No label leakage.**
+- No hypothesis repeats a fixture annotation. The pre-hardening CHG-H001 "10% lacks coverage" hypothesis is gone.
+- The two numeric probe hits (`0.85`, `0.9`) are the Investigator's own `relevance_score` values, not manifest stubs.
+
+**Finding: evidence coverage is 0.0 everywhere, and that is the correct reading of this corpus.**
+- The verifier saw 21–27 retrieved chunks per fixture and marked every material assertion unsupported, with no citations or quotes. Because it judged nothing `supported`, the code-side grounding check had nothing to reject (`grounding_rejections` is empty), and the LLM-reported coverage matches the computed 0.0.
+- Reading the chunks confirms the verifier is right. The knowledge corpus is generated from a template (`scripts/bootstrap_knowledge_corpus.py`): every document repeats the same generic paragraphs with its own name substituted ("Test strategists MUST map required tests to services impacted by … modifications"). No retrieved chunk mentions:
+  - `amount_cents` (CHG-E002);
+  - the GHSA advisory or the vulnerable dependency (CHG-E003);
+  - the changed README files (CHG-H001, CHG-E001).
+
+  The contract documents describe a generic `SubmitRequest`, not the fixture contracts.
+- The assertions themselves are about tool output: contract diff, blast radius, scanner findings and test inventory. These are facts the corpus does not and cannot restate.
+- The Evidence Investigator still labelled most of these chunks `support`. Those are relevance judgements, not support. The verifier no longer sees those labels, and it did not reproduce them.
+- The same corpus produced 0.6–1.0 coverage in the pre-hardening runs. That coverage was the verifier echoing the Investigator's stances, not evidence.
+
+**Consequence for the PASS fixtures.**
+- CHG-H001 scores 20, which is PASS by score. It becomes REVIEW only through `weak-evidence`.
+- CHG-E001 scores 48, which is already REVIEW by score: heuristic blast radius 20, critical service 17.5, and the evidence-confidence penalty 10. Without the penalty it would be 38 (PASS).
+  - The blast radius comes from a heuristic `svc-inventory → svc-payment-api` edge attributed to a documentation file, which the Change Analyst itself flagged as unresolved. It is the same pattern as the earlier CHG-H001 blast-radius entry.
+- Both are calibration findings, not implementation failures: the gate refused to pass changes it could not ground. Thresholds, labels and the corpus were left unchanged.
+
+**Implications for M6.**
+- The corpus needs change-specific content, or the fixtures need assertions the corpus can actually support.
+- Tool-derived assertions (contract diff, scanner output, blast radius) should be verifiable against the deterministic signals that produced them, rather than counted as unsupported prose.
+- The doc-only blast-radius attribution needs a deterministic fix.
+- Until then, a documentation change cannot reach PASS on this corpus, so PASS recall is unmeasured.
