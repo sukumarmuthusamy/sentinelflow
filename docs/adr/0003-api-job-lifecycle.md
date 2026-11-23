@@ -166,6 +166,23 @@ Node inputs, errors and interrupt payloads are dropped in translation, so nothin
 - The live fan-out is per process, so an SSE client must reach the process running the job (one worker, as before).
 - Redaction is shape-based. Beyond configured values and known formats it redacts long or machine-like runs, but a short credential with an unknown, word-like format is not recognised. Machine-like identifiers (long hashes, long mixed-case ids) are redacted even when harmless.
 
+### Harness UI (M5-C)
+
+`ui/` is a Streamlit page and an HTTP client (`ui/harness/client.py`). It is the M5 exit criterion "the entire demo runs through HTTP" made concrete:
+
+- **HTTP only.** The harness imports nothing from `app`, `mcp_server`, LangGraph, LangChain or `sqlite3`. A test parses every `ui/` module and another imports the page in a fresh interpreter and checks `sys.modules`. Only the `/v1` routes and `/health` are used; no API route was added or changed.
+- **Reruns never write.** Session state holds the job id, the durable cursor, the events received and the approval state. A Streamlit rerun only renders it. The only writes are a create, an approval or an evaluation, each sent from the click that asked for it.
+- **One submit, one job.** The `Idempotency-Key` is derived from the form contents and kept until they change or the user presses "New submission". A double click or a retry after an ambiguous timeout replays the original job, never a second one.
+- **Bounded stream reads, not a long-lived connection.** While a job is queued or running, a fragment reruns every second. Each run reads the SSE stream from `Last-Event-ID` for about 1.5 s, stops only between frames, then closes the connection, which releases the server subscription.
+  - A session holds at most one subscription, only while reading.
+  - A job waiting for approval is not streamed: the read stops at `job.waiting_for_approval` and the page shows the approval form instead.
+  - No background thread touches Streamlit.
+- **Replay-safe rendering.** Durable events are keyed by `seq` and fragments by `(run, index)`, so a replay after a reconnect adds no rows. Fragments that arrived while the page was not reading are counted from index gaps and shown as "not received", never reconstructed. Fragments are labelled provisional; the decision panel shows only `GET /decision`.
+- **Decision provenance.** The page shows the deterministic gate (risk score, confidence, override, matched conditions, component scores) apart from the LLM agents' supporting analysis (impacted services, cited findings, recommended tests). It keeps job status and release decision visibly separate.
+- **Errors.** The page shows the API's error code, message and request id. A body that is not the SentinelFlow envelope is reported by status only, never echoed. An unreachable API gets one actionable message. `python -m ui.harness` binds 127.0.0.1, disables usage statistics and hides Streamlit error details.
+
+**Not covered.** Fragments emitted between two reads are lost to that page, by design of the live-only contract. An installed `API_KEY` is sent only as a Bearer header; the UI warns when that would cross a non-loopback plain-HTTP link but does not refuse. The UI has no job list (the API has none) and no cancel or retry.
+
 ## Consequences
 
 ### Positive

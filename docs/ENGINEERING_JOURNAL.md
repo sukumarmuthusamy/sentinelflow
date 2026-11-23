@@ -481,3 +481,30 @@ Tests: `tests/api/test_events_stream.py`, `tests/graph/test_graph_streaming.py`,
 - *Unknown usage is estimated, never zero.* Missing, malformed, negative, fractional and zero counts are replaced by characters divided by 3, which over-counts. Accounting never raises, so an answered call is not retried. The six-call reproduction now stops at the budget and degrades to review.
 
 Tests: `tests/unit/test_stream_redaction.py`, `tests/unit/test_usage_accounting.py`, new cases in `tests/api/test_events_stream.py` and `tests/api/test_approval.py`.
+
+## M5-C harness: polling a stream without a server, and what a real socket showed
+
+**What looked wrong.** The harness had to follow a live SSE stream from Streamlit, which reruns the whole script on every interaction and has no safe way to update the page from a background thread. Building it and then running it on real sockets turned up four problems:
+
+- the first design could not stop reading a stream at a moment that was safe;
+- subscriptions looked leaked in tests;
+- the demo ports were already taken on the development machine;
+- two pieces of UI copy were misleading.
+
+**Investigation.**
+
+- *Reading model.* A background thread could hold one connection open and catch every fragment. But its lifetime is not tied to a browser session, Streamlit calls from it are unsafe, and a job waiting for approval would keep a subscription per abandoned tab (the server caps them at 8). A fragment with `run_every` that reads for a bounded window and disconnects fits the rerun model. Its first version stopped on the deadline after any line, which can cut a frame between `id:` and `data:`. Durable events would be replayed, but a live fragment would be silently lost mid-frame.
+- *Subscriptions.* Against the in-process ASGI client the subscription count was 0 as soon as the read returned. Against uvicorn on a real socket it was still 1: the server learns about a closed TCP connection asynchronously. The release did happen, a few milliseconds later.
+- *Ports.* `127.0.0.1:8000` and `:8501` were already published by Docker Desktop and the WSL relay for other containers, and their `/health` answered without SentinelFlow's `service` field. Streamlit's own default address is all interfaces.
+- *Copy.* "A completed job is not a PASS" read as a contradiction on a PASS decision. The policy-override metric truncated long override names, and status metrics truncated in a narrow pane.
+
+**Root cause.** Streaming in a rerun-driven UI is polling, so correctness has to come from the stream's resumability (`Last-Event-ID`) and idempotent rendering, not from the connection. Tests that never cross a socket hide the asynchrony of disconnects.
+
+**Decision.**
+
+- Bounded reads stop only between frames and close the connection each time. Durable events are keyed by `seq`. Fragments missed between reads are counted from index gaps and never filled in. A job waiting for approval is not streamed.
+- `tests/ui` runs the API under uvicorn on an ephemeral loopback port, so release is checked as "within 5 s", which is what a real client sees.
+- `python -m ui.harness` pins 127.0.0.1 and `scripts/serve_offline_demo.py` binds 127.0.0.1. The README tells users to pass `--port` when 8000 or 8501 is taken. Nothing was stopped on the machine; the demo ran on 8765 and 8766.
+- The copy now says the job status only means the run finished. The override moved into the gate panel, and status and stage are compact badges.
+
+Tests: `tests/ui/` (HTTP client on a real socket, session model, HTTP-only boundary, Streamlit `AppTest` page tests).
