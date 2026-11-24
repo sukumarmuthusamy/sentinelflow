@@ -544,3 +544,30 @@ Tests: `tests/ui/test_key_transport.py`; `tests/api/test_events_stream.py::test_
 
 - Token streaming stays opt-in and off by default, documented as verified incremental on Gemini and burst-only on the OpenRouter model tested.
 - The estimate fallback (hardening M4) did its job; nothing was changed in code. Tracing whether the missing usage comes from the route or from the client's aggregation would need more live calls, so it is left as a follow-up, as is reporting estimated usage to API clients.
+
+## M5 CI: two order-dependent tests, and one real stream defect
+
+**What looked wrong.** On the PR's Linux runner, two tests failed that had passed locally every time:
+
+- `test_many_subscribers_share_one_execution`: one of three SSE subscribers had none of the `agent.token` frames the others received.
+- `test_full_graph_pr1_equals_fixture_h001`: the GitHub-source run called the specialist schemas in a different order from the fixture run.
+
+While verifying the fix locally, a third test failed once: `test_stream_follows_approval_resume_on_the_original_thread` ended its stream after the resumed `job.running`, with no `job.completed`.
+
+**Investigation.**
+
+- *SSE fragments.* All three clients subscribed while the model was paused, but a client's first store read happens a moment later, when its stream starts. On the faster runner, the static model finished the whole run before one client's first read. That client received the full durable log, and its live fragments were older than the last durable event it had sent, so it skipped them. That is the stream's documented rule: a fragment never precedes the durable event it follows. Forcing the delay locally reproduced it exactly: 0 fragments for the late client, 66 for the others, identical durable history.
+- *Graph.* The four specialists run as parallel branches. The order in which their model calls start depends on scheduling and MCP latency, not on the graph. Delaying one branch locally reproduced the reordering.
+- *Missing terminal event.* On an idle keepalive tick, the stream re-read the event log and then checked the job status. If the job finished between those two reads, the stream saw a terminal status, ended, and never sent the terminal event. That breaks the rule that durable events are exactly the store's log. A store that finishes the job right after the stream's second log read reproduces it deterministically.
+
+**Root cause.**
+
+- The first two failures were tests comparing things the system does not promise: live-only fragments across clients, and one order among parallel calls.
+- The third was a real ordering defect in the keepalive safety net of `JobEventStream`.
+
+**Decision.**
+
+- The keepalive check now reads the status first and the log second, the same order the stream already used when it opened. A status change commits in the same transaction as its events, so a job seen as terminal always has its terminal event in the following read.
+- A regression test drives that exact interleaving. It fails without the fix.
+- The SSE subscriber test now waits until every client has made its first store read before resuming, and still requires an identical durable history equal to the store's log. Each client's live fragments are then checked on their own: present, no `stream.gap`, placed right after their durable event, attributed to a started node task, provisional, and never duplicated or reordered.
+- The graph test compares the calls and their counts regardless of order, keeps triage first and the verifier last, and keeps the prompt-content checks.

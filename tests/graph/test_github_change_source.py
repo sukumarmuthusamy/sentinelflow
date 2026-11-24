@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from typing import Any, cast
 
@@ -125,9 +126,13 @@ async def test_full_graph_pr1_equals_fixture_h001(run_graph: RunGraph) -> None:
     assert not github.get("degraded_to_review")
     assert _decision(github) == _decision(fixture)
     assert github["changed_files"] == fixture["changed_files"]
-    assert [schema for schema, _, _ in github_llm.prompts] == [
-        schema for schema, _, _ in fixture_llm.prompts
-    ]
+    # Same calls with the same multiplicities. The specialists run in parallel, so
+    # only the sequential steps have a fixed position: triage first, verifier last.
+    github_schemas = [schema for schema, _, _ in github_llm.prompts]
+    fixture_schemas = [schema for schema, _, _ in fixture_llm.prompts]
+    assert Counter(github_schemas) == Counter(fixture_schemas)
+    assert github_schemas[0] == fixture_schemas[0] == "AnalysisPlan"
+    assert github_schemas[-1] == fixture_schemas[-1] == "VerificationReport"
     analyst = next(user for schema, _, user in github_llm.prompts if schema == "ChangeImpact")
     assert '"source": "github"' in analyst
     for _, system, user in github_llm.prompts:

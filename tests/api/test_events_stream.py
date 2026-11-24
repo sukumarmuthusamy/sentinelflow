@@ -16,9 +16,11 @@ import pytest
 from app.agents.contracts import ChangeImpact
 from app.graph.runner import CheckpointSnapshot
 from app.graph.state import AnalysisPlan
-from app.jobs.events import JobEventType
-from app.jobs.streaming import JobEventStream
-from app.persistence.job_store import SqliteJobStore
+from app.jobs.events import JobEvent, JobEventType
+from app.jobs.models import JobKind, JobRecord, JobStatus
+from app.jobs.service import request_fingerprint
+from app.jobs.streaming import JobEventBus, JobEventStream
+from app.persistence.job_store import SqliteJobStore, utc_now
 from pydantic import BaseModel, SecretStr
 
 from tests.api.conftest import BlockingLLM, FakeRuntime, Harness, HarnessFactory, api_settings
@@ -99,6 +101,38 @@ def _assert_ordered(frames: list[SseEvent], *, first_seq: int = 1) -> None:
 
 def _fragments(frames: list[SseEvent]) -> list[dict[str, Any]]:
     return [frame.json["data"] for frame in named(frames, "agent.token")]
+
+
+def _assert_valid_live_fragments(frames: list[SseEvent]) -> None:
+    """One client's live fragments: present, placed right after the durable event they
+    follow, attributed to a node task already started, provisional, and never
+    duplicated or reordered. No live loss was reported."""
+    assert not named(frames, "stream.gap")
+    assert _fragments(frames)
+    started: dict[str, dict[str, Any]] = {}
+    last_durable = 0
+    indexes: dict[int, list[int]] = {}
+    for frame in frames:
+        if frame.id is not None:
+            last_durable = int(frame.id)
+            if frame.event == "node.started":
+                data = frame.json["data"]
+                started[data["task_id"]] = data
+            continue
+        if frame.event != "agent.token":
+            continue
+        token = frame.json["data"]
+        assert frame.json["after_seq"] == last_durable
+        task = started[token["task_id"]]
+        assert (token["node"], token["agent"], token["run"]) == (
+            task["node"],
+            task["agent"],
+            task["run"],
+        )
+        assert token["provisional"] is True and token["verified"] is False
+        indexes.setdefault(token["run"], []).append(token["index"])
+    for seen in indexes.values():
+        assert seen == sorted(set(seen))
 
 
 # -- framing and headers ------------------------------------------------------------
@@ -308,18 +342,28 @@ async def test_many_subscribers_share_one_execution(
         for client in clients:
             await client.__aenter__()
         assert h.service.bus.subscriber_count(job_id) == 3
+        # Wait until every client has done its first store read and follows the live
+        # queue. Without this, a client whose first read lands after the run ended
+        # correctly gets the full durable log and none of the older live fragments.
+        heads = [await client.wait_for(lambda frame: frame.id is not None) for client in clients]
         llm.model.resume.set()
-        streams = await asyncio.gather(*(client.events_until_end() for client in clients))
+        tails = await asyncio.gather(*(client.events_until_end() for client in clients))
         for client in clients:
             await client.disconnect()
         await h.idle()
+        stored = [(str(event.seq), str(event.type)) for event in h.service.store.events(job_id)]
 
+    streams = [head + tail for head, tail in zip(heads, tails, strict=True)]
     assert runtime.sessions == 1
     assert len(llm.model.streamed_calls) == 6  # one model call per schema, not per client
-    reference = [(frame.id, frame.event, frame.data) for frame in streams[0] if frame.retry is None]
-    for frames in streams[1:]:
-        assert [(f.id, f.event, f.data) for f in frames if f.retry is None] == reference
-    assert _fragments(streams[0])
+    # Durable history: identical for every client, and exactly the store's log.
+    reference = [(frame.id, frame.event, frame.data) for frame in durable(streams[0])]
+    assert [(frame_id, event) for frame_id, event, _ in reference] == stored
+    for frames in streams:
+        assert [(f.id, f.event, f.data) for f in durable(frames)] == reference
+        # Live fragments are delivered to each subscriber independently, so each
+        # client's fragments are checked on their own rather than against another's.
+        _assert_valid_live_fragments(frames)
 
 
 async def test_slow_client_gets_a_gap_and_never_blocks_the_graph(
@@ -810,6 +854,79 @@ async def test_stream_ends_when_the_job_is_terminal_even_if_its_event_was_skippe
         frames = await asyncio.wait_for(reader, 10)
         assert h.service.bus.subscriber_count(job_id) == 0
     assert not any(frame.startswith(b"id:") for frame in frames)
+
+
+class _FinishesAfterSecondRead(SqliteJobStore):
+    """Completes the running job just after the stream's second log read returns:
+    the job ends between the keepalive backfill and the keepalive status check."""
+
+    reads = 0
+
+    def events(self, job_id: str, *, after_seq: int = 0) -> list[JobEvent]:
+        events = super().events(job_id, after_seq=after_seq)
+        self.reads += 1
+        if self.reads == 2:
+            self.transition(
+                job_id,
+                expected=JobStatus.RUNNING,
+                target=JobStatus.COMPLETED,
+                events=[(JobEventType.JOB_COMPLETED, {})],
+            )
+        return events
+
+
+async def test_keepalive_check_never_ends_the_stream_before_the_terminal_event(
+    tmp_path: Path,
+) -> None:
+    """Regression: the stream ended on a job seen terminal without sending its
+    terminal event when the job finished between the two keepalive reads."""
+    store = _FinishesAfterSecondRead(tmp_path / "jobs.sqlite")
+    store.initialize()
+    job_id = "job-" + "b" * 32
+    now = utc_now()
+    request = {"change_id": "CHG-H001", "domain_pack_id": "healthcare-claims"}
+    store.create(
+        JobRecord(
+            job_id=job_id,
+            kind=JobKind.ANALYSIS,
+            status=JobStatus.QUEUED,
+            request=request,
+            request_fingerprint=request_fingerprint(JobKind.ANALYSIS, request),
+            thread_id=f"analysis-{job_id}",
+            created_at=now,
+            updated_at=now,
+        ),
+        max_active=10,
+    )
+    store.transition(
+        job_id,
+        expected=JobStatus.QUEUED,
+        target=JobStatus.RUNNING,
+        events=[(JobEventType.JOB_RUNNING, {"phase": "start"})],
+    )
+    # No store listener: nothing is published, so only the keepalive path can see
+    # the completion.
+    bus = JobEventBus(queue_size=8, max_subscribers_per_job=1)
+    stream = JobEventStream(
+        store=store,
+        subscription=bus.subscribe(job_id),
+        after_seq=0,
+        keepalive_seconds=0.05,
+        retry_ms=1000,
+    )
+    frames = await asyncio.wait_for(_collect(stream), 10)
+    sent = [frame for frame in frames if frame.startswith(b"id:")]
+    assert [frame.split(b"\n")[1] for frame in sent] == [
+        b"event: job.queued",
+        b"event: job.running",
+        b"event: job.completed",
+    ]
+    assert store.reads >= 3
+    assert bus.subscriber_count(job_id) == 0
+
+
+async def _collect(stream: JobEventStream) -> list[bytes]:
+    return [frame async for frame in stream.frames()]
 
 
 async def test_cursor_at_waiting_follows_approval_resume_to_completion(

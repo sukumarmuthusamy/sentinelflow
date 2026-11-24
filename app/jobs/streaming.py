@@ -390,15 +390,19 @@ class JobEventStream:
                 item = await self._sub.get(self._keepalive)
                 if item is None:
                     yield KEEPALIVE_FRAME
+                    # Status first, then the log: a status change commits together
+                    # with its events, so a job seen terminal here has its terminal
+                    # event in the backfill below. The other order could end the
+                    # stream on a job that finished between the two reads, without
+                    # ever sending its terminal event.
+                    job = await asyncio.to_thread(self._store.get, self._job_id)
                     # Cheap safety net for anything a dropped publish may have missed.
                     async for frame in self._backfill():
                         yield frame
-                    if not self._done:
-                        # Never outlive the job: a terminal job has no more events to
-                        # wait for, even if its terminal event was not sent here.
-                        job = await asyncio.to_thread(self._store.get, self._job_id)
-                        if job is None or job.status in TERMINAL_STATUSES:
-                            self._done = True
+                    # Never outlive the job: a terminal job has no more events to wait
+                    # for, even if its terminal event was skipped by the cursor.
+                    if job is None or job.status in TERMINAL_STATUSES:
+                        self._done = True
                     continue
                 async for frame in self._deliver(item):
                     yield frame
