@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar, cast
 
@@ -24,6 +26,9 @@ from app.model_gateway.pacing import AsyncMinIntervalPacer
 T = TypeVar("T", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
+
+# Run-metadata key set on every structured-output call made through the gateway.
+STRUCTURED_OUTPUT_METADATA_KEY = "sentinelflow_structured_schema"
 
 
 class StructuredOutputError(Exception):
@@ -63,11 +68,76 @@ class StructuredLLM(Protocol):
         ...
 
 
-def _usage_tokens(raw: object) -> tuple[int, int]:
+# Conservative characters-per-token ratio for estimating unreported usage. Real
+# tokenizers average about 4 characters per token on English and JSON, so dividing
+# by 3 over-counts: an unknown call is charged more, never less, than it likely cost.
+CHARS_PER_TOKEN_ESTIMATE = 3
+
+
+@dataclass(frozen=True)
+class UsageAccount:
+    """Tokens charged for one provider call; ``estimated`` if any count was not reported."""
+
+    input_tokens: int
+    output_tokens: int
+    estimated: bool
+
+
+def _reported_count(usage: dict[Any, Any], key: str) -> int | None:
+    """A usable reported count, or None when it is absent, malformed or zero.
+
+    Zero is treated as unknown: a call with a non-empty prompt and a structured
+    answer cannot have used zero tokens, so a zero report is a missing report.
+    """
+    value = usage.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if isinstance(value, float) and not (math.isfinite(value) and value.is_integer()):
+        return None
+    count = int(value)
+    return count if count > 0 else None
+
+
+def _output_chars(raw: object) -> int:
+    content = getattr(raw, "content", "")
+    size = len(content if isinstance(content, str) else json.dumps(content, default=str))
+    for call in getattr(raw, "tool_calls", None) or []:
+        args = call.get("args") if isinstance(call, dict) else None
+        size += len(json.dumps(args, default=str))
+    return size
+
+
+def _estimate(chars: int) -> int:
+    return max(1, math.ceil(chars / CHARS_PER_TOKEN_ESTIMATE))
+
+
+def account_usage(raw: object, *, prompt_chars: int) -> UsageAccount:
+    """Tokens to charge for a call that the provider has already answered (and billed).
+
+    Never raises and never returns zero for an unknown count: a missing, malformed,
+    negative, fractional or zero report is replaced by a conservative estimate
+    from the prompt and response sizes, so a provider that stops reporting usage
+    cannot bypass the per-analysis token budgets. Valid reported counts are used
+    as reported. Values are not logged.
+    """
     usage = getattr(raw, "usage_metadata", None)
-    if not isinstance(usage, dict):
-        return 0, 0
-    return int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+    reported = usage if isinstance(usage, dict) else {}
+    input_tokens = _reported_count(reported, "input_tokens")
+    output_tokens = _reported_count(reported, "output_tokens")
+    estimated = input_tokens is None or output_tokens is None
+    if estimated:
+        logger.warning(
+            "provider usage missing or malformed (input %s, output %s); charging an estimate",
+            "ok" if input_tokens is not None else "unknown",
+            "ok" if output_tokens is not None else "unknown",
+        )
+    return UsageAccount(
+        input_tokens=input_tokens if input_tokens is not None else _estimate(prompt_chars),
+        output_tokens=(
+            output_tokens if output_tokens is not None else _estimate(_output_chars(raw))
+        ),
+        estimated=estimated,
+    )
 
 
 class _PacedStructuredLLM:
@@ -116,6 +186,12 @@ class _PacedStructuredLLM:
                 method=self.structured_method,
                 include_raw=True,
             )
+        # Metadata only (no behaviour change): it rides on callback events, so a
+        # LangGraph "messages" stream can tell this gateway's structured-output runs
+        # from any other model call, and name the schema a fragment belongs to.
+        structured = structured.with_config(
+            metadata={STRUCTURED_OUTPUT_METADATA_KEY: schema.__name__},
+        )
         messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
         attempt = 0
         while True:
@@ -146,7 +222,11 @@ class _PacedStructuredLLM:
         if not isinstance(result, dict):
             msg = f"Unexpected structured output container: {type(result).__name__}"
             raise StructuredOutputError(msg)
-        input_tokens, output_tokens = _usage_tokens(result.get("raw"))
+        usage = account_usage(
+            result.get("raw"),
+            prompt_chars=len(system_prompt) + len(user_prompt),
+        )
+        input_tokens, output_tokens = usage.input_tokens, usage.output_tokens
         parsed = result.get("parsed")
         if parsed is None:
             error = result.get("parsing_error")
@@ -199,6 +279,9 @@ class OpenRouterStructuredLLM(_PacedStructuredLLM):
             "api_key": self._settings.require_openrouter_api_key(),
             "base_url": self._settings.openrouter_base_url,
             "default_headers": {"X-Title": "SentinelFlow"},
+            # Only affects streamed calls (API_STREAM_TOKENS): with a custom base URL
+            # langchain-openai omits usage from streams, which would zero token budgets.
+            "stream_usage": True,
         }
         if self._client_max_retries is not None:
             kwargs["max_retries"] = self._client_max_retries

@@ -389,3 +389,185 @@ Evidence: `evals/github/m2_live_smoke_tools.json`.
 - *gitleaks configuration.* gitleaks gets an explicit default config and a trusted ignore path, PR files are staged one level below the target, and inline allow comments are ignored. Its default rule allowlists, such as the one for AWS `EXAMPLE` keys, are unchanged.
 
 Tests: `tests/contract/test_github_hardening.py`, `tests/unit/test_github_signal_tools.py`, and the scanner-failure and rename cases in `tests/graph/test_github_change_source.py`.
+
+## M5-A HTTP boundary: provider errors arrived wrapped, debug mode served tracebacks, and graph state was not safe to return
+
+**What looked wrong.** The first ASGI test of a provider quota stop expected `PROVIDER_RATE_LIMITED` and got `JOB_EXECUTION_FAILED`, logged as `ExceptionGroup`. Writing the rest of the error tests turned up four more ways the HTTP boundary would have misreported or leaked:
+
+- The M0 app passed `settings.debug` to FastAPI.
+- A `500` response had no `X-Request-ID` header.
+- Domain-pack loader errors carry local paths.
+- The graph's `errors` list embeds exception text.
+
+**Investigation.**
+
+- *ExceptionGroup.* `GraphExecutor` runs the graph inside the MCP adapter's `async with`. The adapter's anyio task group wraps any exception that crosses its exit in an `ExceptionGroup`, whose `str()` is "unhandled errors in a TaskGroup". Every classifier in `model_gateway/errors.py` reads `str(exc)` or attributes on the outer object, so a 429 and a rejected key would both have been reported as generic failures. `scripts/run_m4_sample.py` never hit this because its `try` sits *inside* the `async with`.
+- *Debug mode.* With `debug=True`, Starlette's `ServerErrorMiddleware` answers an unhandled exception with an HTML traceback before any registered handler runs. A `.env` with `DEBUG=true` would have published tracebacks over the API.
+- *Request ID.* That same outermost middleware sends the `500`, so a header added by user middleware never reaches it.
+- *Loader details.* `load_domain_pack` puts the pack directory path and the YAML parser's message in `details`.
+- *Graph errors.* Agent failures are recorded as `"<agent> failed: <Type>: <message[:200]>"`, and provider messages can include request URLs.
+- *Approval payload.* The approval node coerces its payload with `bool(...)`, so a string `"false"` would approve.
+
+**Root cause.** M4's interfaces were written for trusted in-process callers. Exception text, loader details and loose payload coercion were harmless there, and become a leak or a bypass once HTTP clients sit on the other side.
+
+**Decision.**
+
+- *Classifying failures.* `classify_failure` unwraps exception groups to the first leaf before classifying. MCP and change-source types are matched before any status-code check, because an MCP error's `code` is a JSON-RPC code, not HTTP.
+- *Error responses.* The API never enables debug mode. Error responses set `X-Request-ID` themselves, and the error envelope passes only allowlisted detail keys. Pack errors are re-raised with only the pack ID.
+- *Degradation.* Graph errors become `DegradationReason` codes. Deterministic gap text is kept (truncated, control characters stripped), because the deterministic layer writes it itself.
+- *Approval.* The approval body is strict at the API: `StrictBool`, extra fields forbidden, and no decision field. Only `{"approved": bool}` reaches the graph. The M4 node is unchanged.
+
+Also caught by an existing guard: the domain-vocabulary leak test flagged the word "claim", used for "claiming a job", in `app/jobs` and `app/persistence`. The wording is now "acquire" and "reserve".
+
+Tests: `tests/api/test_errors_and_security.py` and `tests/api/test_approval.py`.
+
+## M5-B streaming: observing the run changed the provider calls, and four ways fragments could mislead or leak
+
+**What looked wrong.** While wiring LangGraph's `messages` stream mode into the executor, a reading of `BaseChatModel._should_stream` showed that *observing* a run changes it. Then the token tests and a test-first pass over the sink turned up four more problems:
+
+- a model that does not stream would produce a fake token;
+- a credential split across chunks would pass a per-chunk filter;
+- a client that disconnects before its first frame would leak its subscription;
+- a lagging client that caught up after the job finished never learned it had lost fragments.
+
+**Investigation.**
+
+- *Provider call path.*
+  - `messages` mode attaches a `_StreamingCallbackHandler`, and LangChain then calls the provider's streaming endpoint instead of the plain one. For Gemini and OpenRouter that is a different HTTP call from the one M4 validated.
+  - `langchain-openai` enables `stream_usage` only for the default OpenAI base URL. With OpenRouter's `base_url`, a streamed response has no usage, so `LLMResult` tokens and the per-analysis token budget would read zero.
+- *Fake tokens.* For a model without streaming (`disable_streaming=True`), LangGraph's `messages` handler still emits the finished `AIMessage` from `on_llm_end`. A translator that accepted any message would have reported a whole response as one "token".
+- *Split credentials.* The fake model streams 5-9 characters per chunk, so an `AIza…` key spans five chunks, and no per-chunk regex can see it. A greedy pattern applied to a partial key redacts the prefix and lets the tail through on the next chunk.
+- *Leaked subscription.* Starlette's `StreamingResponse` cancels its task group on `http.disconnect`. If that happens before the first frame, the async generator never starts, so its `finally` never runs.
+- *Lost gap notice.* Recovery after lag re-read durable events from the store and returned as soon as it delivered `job.completed`, before emitting `stream.gap`. The slow-client test caught it: all durable events arrived and no gap was reported.
+
+**Root cause.** Streaming is not a passive tap: it changes which provider API is called, it reports non-streamed output as messages, and it moves data out in pieces, which defeats checks that look at one piece at a time.
+
+**Decision.**
+
+- *Token streaming is opt-in.*
+  - `API_STREAM_TOKENS` defaults to false. Node and lifecycle events always stream, and they need no provider change.
+  - The OpenRouter client sets `stream_usage=True`, which affects only streamed calls.
+  - Live streaming is documented as unverified (ADR-0003). No paid call was made to verify it.
+- *Only real chunks.* A fragment is forwarded only if it is an `AIMessageChunk` from a run the gateway tagged as structured output. Thinking blocks are dropped. A `disable_streaming` test pins that a non-streaming model yields zero fragments and that the model really answered.
+- *Redaction window.* Redaction runs over a 128-character held-back window per response. A match that touches the end of the buffer is held whole until it can no longer grow, and a private-key block is held until its END line. A randomized-chunking test feeds six credential shapes in 1-12 character pieces and checks that neither the key nor its tail is emitted. The cost: fragments arrive up to 128 characters late and are re-chunked, which the event contract states.
+- *Subscription release.* `EventStreamResponse.__call__` closes the subscription in its own `finally`, which runs whether or not the generator started.
+- *Gap first.* Recovery emits `stream.gap` before the re-read durable events, which is also where the loss happened.
+
+Tests: `tests/api/test_events_stream.py`, `tests/graph/test_graph_streaming.py`, `tests/unit/test_stream_policy.py`.
+
+## M5 hardening: a fixed redaction window, a cursor from the future, a silent audit miss and usage read as zero
+
+**What looked wrong.** An independent backend review of M5-A/M5-B found four conditions, each reproduced offline before any fix:
+
+- a 241-character JWT fed in 7-character chunks left its first 113 characters in the stream, and a 146-character configured secret leaked its prefix;
+- `Last-Event-ID: 999` on a running job held the stream and its subscriber slot open forever;
+- an MCP double answering `record_gate_decision` with `recorded=false, duplicate=false` let an approved job end `completed`;
+- with no `usage_metadata`, six model calls settled as 0 tokens against a 1,000-token budget, and `input_tokens: "bad"` raised `ValueError` after the provider had answered.
+
+**Investigation.**
+
+- *Redaction.* The M5-B redactor held back the last 128 characters and released everything before them. Any credential longer than the window had a prefix outside it, which no pattern could yet match because the credential was incomplete. The configured-secret list also missed `POSTGRES_PASSWORD`, the password inside `DATABASE_URL` and `SENTINELFLOW_GITHUB_TOKEN`.
+- *Cursor.* Replay read events after the cursor, found none, then waited on the queue. Every new event had `seq <= cursor` and was skipped as "already sent", including `job.completed`, so the stream never saw the end. The keepalive safety net re-read events, also after the cursor.
+- *Gate write.* The graph node turns an unsuccessful write into a state error and does not set `record_decision_written`. The service settled any run that reached END as `completed`; it checked the decision invariant but not whether the approved write happened.
+- *Usage.* `_usage_tokens` returned `(0, 0)` for a missing report and called `int()` on whatever it found.
+
+**Root cause.** Each path trusted an assumption about its input: that a secret fits in a window, that a cursor names a committed event, that a non-raising MCP call succeeded, and that a provider always reports usage.
+
+**Decision.**
+
+- *Redaction without a window.* Text is emitted only once it cannot become part of a secret. The open token run is held until a delimiter closes it, the longest suffix that could start a configured secret is held, credential keywords and `//user:` are held until their value ends, and closed runs are classified whole (known shapes, longer than 200 characters, or machine-like). Raising the window would only move the boundary. Holding is bounded instead: past 1,024 characters (plus the longest configured secret) the held run becomes one `[REDACTED]` and the rest of it is discarded, which fails closed and caps memory. Tests feed synthetic JWTs, provider keys and configured secrets (including ones longer than the cap and ones with quotes) in 1-12-character random chunks and assert that no 8-character piece survives; the M5-B reassembly tests still pass byte for byte. Porting the original M5-B redaction cases to the new API caught one more gap: in `xxxBearer <token>` the keyword hold required a word boundary that the `Bearer` shape does not, so `Bearer ` was released before its token arrived. The holds now include an unanchored `bearer` and are re-applied until the cut stops moving, so streaming is never weaker than redacting the complete text. The cost: harmless machine-like identifiers are redacted, and a short word-like secret of unknown format is still not recognised.
+- *Cursor policy.* A cursor above the job's latest committed `seq` is refused with `422 INVALID_REQUEST` (`field`, `latest_event_id`) before subscribing, so no slot is taken. A skipped terminal event and a terminal job seen at a keepalive both end the stream. A 422 was preferred over silently restarting from 0: the client's cursor is wrong, and replaying a different history under it would hide that.
+- *Confirmed gate writes.* An approved, recording job completes only if the write was recorded or is an idempotent duplicate; otherwise it fails with `GATE_DECISION_NOT_RECORDED`, keeps its pre-approval result, and the write is not retried.
+- *Unknown usage is estimated, never zero.* Missing, malformed, negative, fractional and zero counts are replaced by characters divided by 3, which over-counts. Accounting never raises, so an answered call is not retried. The six-call reproduction now stops at the budget and degrades to review.
+
+Tests: `tests/unit/test_stream_redaction.py`, `tests/unit/test_usage_accounting.py`, new cases in `tests/api/test_events_stream.py` and `tests/api/test_approval.py`.
+
+## M5-C harness: polling a stream without a server, and what a real socket showed
+
+**What looked wrong.** The harness had to follow a live SSE stream from Streamlit, which reruns the whole script on every interaction and has no safe way to update the page from a background thread. Building it and then running it on real sockets turned up four problems:
+
+- the first design could not stop reading a stream at a moment that was safe;
+- subscriptions looked leaked in tests;
+- the demo ports were already taken on the development machine;
+- two pieces of UI copy were misleading.
+
+**Investigation.**
+
+- *Reading model.* A background thread could hold one connection open and catch every fragment. But its lifetime is not tied to a browser session, Streamlit calls from it are unsafe, and a job waiting for approval would keep a subscription per abandoned tab (the server caps them at 8). A fragment with `run_every` that reads for a bounded window and disconnects fits the rerun model. Its first version stopped on the deadline after any line, which can cut a frame between `id:` and `data:`. Durable events would be replayed, but a live fragment would be silently lost mid-frame.
+- *Subscriptions.* Against the in-process ASGI client the subscription count was 0 as soon as the read returned. Against uvicorn on a real socket it was still 1: the server learns about a closed TCP connection asynchronously. The release did happen, a few milliseconds later.
+- *Ports.* `127.0.0.1:8000` and `:8501` were already published by Docker Desktop and the WSL relay for other containers, and their `/health` answered without SentinelFlow's `service` field. Streamlit's own default address is all interfaces.
+- *Copy.* "A completed job is not a PASS" read as a contradiction on a PASS decision. The policy-override metric truncated long override names, and status metrics truncated in a narrow pane.
+
+**Root cause.** Streaming in a rerun-driven UI is polling, so correctness has to come from the stream's resumability (`Last-Event-ID`) and idempotent rendering, not from the connection. Tests that never cross a socket hide the asynchrony of disconnects.
+
+**Decision.**
+
+- Bounded reads stop only between frames and close the connection each time. Durable events are keyed by `seq`. Fragments missed between reads are counted from index gaps and never filled in. A job waiting for approval is not streamed.
+- `tests/ui` runs the API under uvicorn on an ephemeral loopback port, so release is checked as "within 5 s", which is what a real client sees.
+- `python -m ui.harness` pins 127.0.0.1 and `scripts/serve_offline_demo.py` binds 127.0.0.1. The README tells users to pass `--port` when 8000 or 8501 is taken. Nothing was stopped on the machine; the demo ran on 8765 and 8766.
+- The copy now says the job status only means the run finished. The override moved into the gate panel, and status and stage are compact badges.
+
+Tests: `tests/ui/` (HTTP client on a real socket, session model, HTTP-only boundary, Streamlit `AppTest` page tests).
+
+## M5 final review fixes: a loopback check that trusted a hostname prefix
+
+**What looked wrong.** The final review found that the harness would send `Authorization: Bearer <key>` in cleartext to any `http://` host, with only a sidebar warning. Its loopback test also accepted `http://127.evil.com:8000`.
+
+**Investigation.** `is_loopback_url` matched `host.startswith("127.")`, a text test on a name that DNS can point anywhere. The warning was only advisory: the comparison was case-sensitive (`HTTP://` skipped it) and every click and background poll still sent the header. Both reproduced with an injected transport recording the header.
+
+**Root cause.** The safety decision lived in the page as a hint, not in the client as a rule, and it judged a hostname by its spelling instead of parsing an address.
+
+**Decision.**
+
+- Loopback is the exact name `localhost` or a literal address whose `ipaddress` value is loopback. The host comes from `httpx.URL`, the parser that decides where the request goes.
+- `SentinelFlowClient` refuses an API key for any URL that is neither `https://` nor loopback (`INSECURE_API_URL`), when built and again in a request hook, before anything is sent. Redirects stay off.
+- The page shows that error and stops rendering the workspace, so no client is built and nothing is sent.
+- Two small fixes from the same review:
+  - the verdict in the HTML decision card is escaped;
+  - `latest_event_id` is now on the error-detail allowlist, so a future-cursor 422 carries it as ADR-0003 already documented.
+
+Tests: `tests/ui/test_key_transport.py`; `tests/api/test_events_stream.py::test_future_cursor_on_an_active_job_is_refused`.
+
+## M5 live streaming smoke test: what two providers actually sent
+
+**What looked wrong.** Token streaming had only been tested with fake streaming models. One live run was made to check it against real providers: one synthetic fixture, free-tier routes, retrieval off, and a hard cap on provider requests. It showed the two providers behave differently.
+
+**Investigation.**
+
+- *Gemini (triage).* The request went to `streamGenerateContent`. Its structured JSON arrived in several chunks, all before `node.completed`, each tagged with the right task and agent. The provider reported usage.
+- *OpenRouter (agent).* The request streamed and returned 200 at once, but nothing visible arrived for about 20 seconds. The structured answer then came as one burst, which the server cut into fragments at `API_STREAM_FRAGMENT_MAX_CHARS`. The streamed JSON matched the checkpointed result exactly.
+- *Usage.* The OpenRouter stream ended with no usage metadata even with `stream_usage=True`, so `account_usage` charged its conservative estimate instead of zero. The estimate is visible only in the server log, not in the trace returned by the API.
+
+**Root cause.** Streaming behaviour depends on the provider and the model. A model that reasons before answering, behind an OpenAI-compatible route, can stream its connection without streaming its answer. Usage reporting on streamed responses also varies by route.
+
+**Decision.**
+
+- Token streaming stays opt-in and off by default, documented as verified incremental on Gemini and burst-only on the OpenRouter model tested.
+- The estimate fallback (hardening M4) did its job; nothing was changed in code. Tracing whether the missing usage comes from the route or from the client's aggregation would need more live calls, so it is left as a follow-up, as is reporting estimated usage to API clients.
+
+## M5 CI: two order-dependent tests, and one real stream defect
+
+**What looked wrong.** On the PR's Linux runner, two tests failed that had passed locally every time:
+
+- `test_many_subscribers_share_one_execution`: one of three SSE subscribers had none of the `agent.token` frames the others received.
+- `test_full_graph_pr1_equals_fixture_h001`: the GitHub-source run called the specialist schemas in a different order from the fixture run.
+
+While verifying the fix locally, a third test failed once: `test_stream_follows_approval_resume_on_the_original_thread` ended its stream after the resumed `job.running`, with no `job.completed`.
+
+**Investigation.**
+
+- *SSE fragments.* All three clients subscribed while the model was paused, but a client's first store read happens a moment later, when its stream starts. On the faster runner, the static model finished the whole run before one client's first read. That client received the full durable log, and its live fragments were older than the last durable event it had sent, so it skipped them. That is the stream's documented rule: a fragment never precedes the durable event it follows. Forcing the delay locally reproduced it exactly: 0 fragments for the late client, 66 for the others, identical durable history.
+- *Graph.* The four specialists run as parallel branches. The order in which their model calls start depends on scheduling and MCP latency, not on the graph. Delaying one branch locally reproduced the reordering.
+- *Missing terminal event.* On an idle keepalive tick, the stream re-read the event log and then checked the job status. If the job finished between those two reads, the stream saw a terminal status, ended, and never sent the terminal event. That breaks the rule that durable events are exactly the store's log. A store that finishes the job right after the stream's second log read reproduces it deterministically.
+
+**Root cause.**
+
+- The first two failures were tests comparing things the system does not promise: live-only fragments across clients, and one order among parallel calls.
+- The third was a real ordering defect in the keepalive safety net of `JobEventStream`.
+
+**Decision.**
+
+- The keepalive check now reads the status first and the log second, the same order the stream already used when it opened. A status change commits in the same transaction as its events, so a job seen as terminal always has its terminal event in the following read.
+- A regression test drives that exact interleaving. It fails without the fix.
+- The SSE subscriber test now waits until every client has made its first store read before resuming, and still requires an identical durable history equal to the store's log. Each client's live fragments are then checked on their own: present, no `stream.gap`, placed right after their durable event, attributed to a started node task, provisional, and never duplicated or reordered.
+- The graph test compares the calls and their counts regardless of order, keeps triage first and the verifier last, and keeps the prompt-content checks.

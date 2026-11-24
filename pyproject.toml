@@ -48,6 +48,10 @@ dev = [
     "types-networkx>=3.2.1",
     "types-pyyaml>=6.0.12",
 ]
+# M5-C Streamlit harness: an HTTP client of the API, not a backend dependency.
+ui = [
+    "streamlit>=1.45.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -59,7 +63,7 @@ packages = ["app"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["app", "mcp_server", "evals", "tests"]
+src = ["app", "mcp_server", "evals", "tests", "ui"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM"]

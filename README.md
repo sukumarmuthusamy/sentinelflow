@@ -11,9 +11,10 @@ SentinelFlow ingests a proposed software change and produces an **evidence-cited
 | **M2** | Complete | `sentinelflow-context` MCP server (7 tools, 3 resources), typed client adapter, read-only GitHub PR change source behind the same tools |
 | **M3** | Complete | Hybrid RAG, pgvector + Qdrant adapters, Gemini embeddings, reranker ablation (none vs Voyage), eval harness |
 | **M4** | Complete (merged in #1) | LangGraph workflow, five agents, triage planner, checkpoint + approval interrupt. A post-hardening live check ran on an OpenRouter stand-in model across 4 fixtures: both expected BLOCKs held, the 2 expected PASS fixtures returned REVIEW, and 0 invalid citations survived. Evidence coverage was 0% on the templated corpus. The primary Gemini model is not yet evaluated |
+| **M5** | Complete on branch, in review | M5-A: versioned HTTP API with durable jobs, `Idempotency-Key`, approval resume over HTTP, an evaluation trigger and machine-readable errors. M5-B: SSE progress stream with durable node events, `Last-Event-ID` replay and opt-in live structured-output fragments. M5-C: Streamlit harness that drives all of it over HTTP only. Token streaming is opt-in; a live smoke test saw incremental fragments from Gemini and one-burst delivery from OpenRouter |
 
 Canonical architecture and roadmap: [SENTINELFLOW_PLAN.md](SENTINELFLOW_PLAN.md).  
-Real obstacles and tradeoffs from M0–M4: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
+Real obstacles and tradeoffs from M0–M5: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
 
 ---
 
@@ -38,6 +39,7 @@ M0–M2 and M1 fixture evaluation require **no API keys**. M3 requires Gemini + 
 
 ```bash
 uv sync --extra dev
+uv sync --extra dev --extra ui   # also the M5-C Streamlit harness
 ```
 
 **With pip:**
@@ -81,15 +83,18 @@ Runtime output under `.sentinelflow/` and `evals/retrieval/reports/` is gitignor
 ### 3. Run tests (any milestone)
 
 ```bash
-uv run ruff check app mcp_server tests
+uv run ruff check app mcp_server ui tests
 uv run mypy app
+uv run mypy ui
 uv run pytest
 ```
+
+`tests/ui` needs the `ui` extra; without it the Streamlit tests are skipped.
 
 ### 4. Run the API (M0+)
 
 ```bash
-uv run uvicorn app.main:app --reload
+uv run python -m app.api.serve          # 127.0.0.1:8000, one worker (see M5)
 ```
 
 ---
@@ -323,3 +328,107 @@ Callable from Python (no HTTP yet): `app/graph/` wires intake → deterministic 
 - **Tests:** `tests/graph/` runs the full graph offline (static LLM, in-memory MCP, fake retriever): interrupt/resume and exactly-once audit writes, evidence grounding, label leakage, degradation paths
 
 See [SENTINELFLOW_PLAN.md § M4](SENTINELFLOW_PLAN.md) for exit criteria.
+
+---
+
+## M5 — HTTP API (M5-A: contracts and job lifecycle; M5-B: SSE streaming; M5-C: harness UI)
+
+A local development harness, not a public service. The design, guarantees and limits are in [ADR-0003](docs/adr/0003-api-job-lifecycle.md).
+
+**Run.** `uv run python -m app.api.serve` binds `127.0.0.1:8000` with one worker. Without `API_KEY`, `/v1` answers loopback clients only. With it, every request needs `Authorization: Bearer <key>`, and `--host` may be non-loopback. OpenAPI docs are at `/docs`. **A `POST /v1/analyses` runs the real graph and spends provider quota.** It needs `GEMINI_API_KEY`, plus `OPENROUTER_API_KEY` for `vendor/model` IDs, and pgvector for retrieval. Without them the request is refused with `503 PROVIDER_NOT_CONFIGURED` before a job is created.
+
+| Method and path | Purpose |
+|---|---|
+| `POST /v1/analyses` | Start an analysis. Body `{change_id, domain_pack_id, objective?, execute_tests?, record_decision?, source?}`. Returns `202` and `Location`. Optional `Idempotency-Key` |
+| `GET /v1/analyses/{job_id}` | Job status: `queued`, `running`, `waiting_for_approval`, `completed` or `failed` |
+| `GET /v1/analyses/{job_id}/decision` | Risk assessment, cited report, plan, degradation codes, approval state and trace. Available while waiting for approval and after completion; `409 RESULT_NOT_AVAILABLE` before that |
+| `POST /v1/analyses/{job_id}/approval` | `{approved, reviewer, comment?}` (strict). Resumes the original LangGraph thread. Accepted once only |
+| `GET /v1/analyses/{job_id}/events` | Server-Sent Events: lifecycle and node events (replayable with `Last-Event-ID`) and, when enabled, live `agent.token` fragments. Ends after `job.completed` / `job.failed` |
+| `POST /v1/evaluations` | `{suite: "deterministic_fixtures", domain_pack_ids?}`. Runs the M1 fixture evaluation offline. Optional `Idempotency-Key` |
+| `GET /v1/evaluations/{job_id}` and `.../result` | Evaluation status and per-fixture rows with a summary |
+
+**Semantics.**
+
+- **Replays and conflicts.** The same `Idempotency-Key` with the same validated body returns the original job (`200`, `Idempotent-Replayed: true`), even if that job failed. The same key with a different body is `409 IDEMPOTENCY_KEY_CONFLICT`.
+- **REVIEW is not a failure.** A REVIEW outcome, including a degraded run, is a `completed` job. `failed` means execution stopped: provider quota or auth, MCP, the change source, or an interrupted process.
+- **Restarts.** A `running` job found at startup is marked `JOB_INTERRUPTED` and is not re-run. Queued jobs are relaunched, and jobs waiting for approval stay resumable.
+- **Errors.** Every error is `{"error": {code, message, details, request_id}}`.
+
+**Example.**
+
+```bash
+curl -s -X POST localhost:8000/v1/evaluations -H 'Idempotency-Key: eval-1' -H 'content-type: application/json' -d '{}'
+curl -s localhost:8000/v1/evaluations/<job_id>/result
+```
+
+**Tests.** `tests/api/` drives the ASGI app over HTTP with a static LLM, the in-process MCP server on fixtures and a fake retriever. No test makes a provider or network call. Stream tests use a streaming ASGI client (`tests/api/sse_client.py`) and `FakeStreamingGatewayLLM`, the production gateway over a chat model that really streams its JSON in chunks.
+
+**Streaming (M5-B).** One SSE stream per analysis; the full policy is in ADR-0003 "Streaming".
+
+- **Durable events** carry `id:` = per-job `seq` and are replayed after `Last-Event-ID`, without duplicates:
+  - `job.*` lifecycle events;
+  - `node.started` / `node.completed`, with the node, LangGraph task id, agent, run number, and the *names* of the state keys a node wrote.
+- **Live events** carry no `id:` and are never replayed. Each has `after_seq`, the durable event it follows:
+  - `agent.token`: provisional, unverified JSON fragments of an agent's structured output;
+  - `stream.gap`: this client fell behind and lost live events.
+- **Stream lifetime.** The stream stays open while the job waits for approval, with keepalive comments, and ends after `job.completed` or `job.failed`. Disconnecting never affects the job.
+- **Token streaming is opt-in** (`API_STREAM_TOKENS=true`) and off by default. It makes providers use their streaming APIs. Node and lifecycle events always stream.
+
+**Live verification.** A controlled smoke test ran one synthetic fixture analysis through the HTTP analysis and SSE endpoints, with token streaming on, Gemini Flash Lite for triage and a free OpenRouter model for the agents. Retrieval was disabled.
+
+- **Gemini:** produced incremental structured-output fragments before its node completed.
+- **OpenRouter:** completed structured-output streaming, but delivered the answer as one burst. Its stream carried no usage metadata, so the conservative token estimate was charged.
+- **Not covered:** the full RAG pipeline, embeddings, live approval and resume, and concurrent live agent streams.
+
+This is separate from the complete offline HTTP demo (M5-C below) and from the full RAG evaluation, which is deferred to M6.
+
+```bash
+curl -N localhost:8000/v1/analyses/<job_id>/events
+curl -N -H 'Last-Event-ID: 12' localhost:8000/v1/analyses/<job_id>/events
+```
+
+### M5-C — Streamlit harness
+
+A local developer harness for the API (`ui/`). It is an HTTP client only: it imports nothing from `app`, never runs the graph or reads the job store, and every action is one of the `/v1` calls above. `tests/ui/test_http_only_boundary.py` pins that. Design and limits: ADR-0003 "Harness UI".
+
+- **Analysis:** pick a domain pack and change id (bundled fixtures are suggested; any id can be typed), the source (`fixture` or `github`) and the request options, then launch. Or open an existing job by id; that only reads it.
+- **Progress:** job status and stage, one row per node task from the SSE stream (parallel agents are told apart by agent and task id), lifecycle events with their ids, and live fragments only when the server sends them, labelled provisional and unverified.
+- **Decision:** PASS / REVIEW / BLOCK from the deterministic gate, shown apart from the LLM agents' supporting analysis (impacted services, cited findings, recommended tests), with evidence coverage, degradation reasons and trace metrics.
+- **Approval:** only while the job is `waiting_for_approval`. You must enter a reviewer and tick a confirmation; nothing is approved automatically. The decision stays visible afterwards, with the final audit status (recorded, rejected, or not recorded after a failed write).
+- **Evaluation:** runs the deterministic fixture suite and labels its result a fixture consistency check, not model-quality accuracy.
+
+**How the page uses the API.** Launches send an `Idempotency-Key` that depends on the form contents. Pressing Launch twice, or retrying after a timeout, returns the job already created; **New submission** starts a fresh key. Reruns never send a create. While a job is queued or running, the page reads the event stream for about 1.5 s at a time from the last durable event id, then disconnects. So a session holds at most one subscription, a reconnect resumes without duplicate rows, and a job waiting for approval holds none. Fragments missed between reads are counted, never filled in.
+
+**Install and launch.**
+
+```bash
+uv sync --extra dev --extra ui
+uv run --extra ui python -m ui.harness            # http://127.0.0.1:8501, loopback only
+```
+
+Windows PowerShell is the same, plus how to point the UI at another API or pass a key:
+
+```powershell
+$env:SENTINELFLOW_API_URL = "http://127.0.0.1:8000"   # default
+$env:SENTINELFLOW_API_KEY = "<only if the server sets API_KEY>"
+uv run --extra ui python -m ui.harness
+```
+
+The key can also be typed into the sidebar's password field; it stays in that browser session and is never displayed. The harness sends a key only over `https://` or to a loopback address (`127.0.0.1`, `::1`, `localhost`); for any other `http://` URL it shows `INSECURE_API_URL` and sends nothing. `python -m ui.harness` binds 127.0.0.1, turns off Streamlit usage statistics and hides error details. `.streamlit/config.toml` does the same for `streamlit run ui/streamlit_app.py`.
+
+**Local demo (offline, no credentials).**
+
+1. Start the API with offline test doubles. The graph, job store, SSE, gate, MCP server and audit log are real; the model gives canned answers and retrieval is off:
+   ```bash
+   uv run --extra dev python scripts/serve_offline_demo.py --stream-tokens
+   ```
+2. Start the UI: `uv run --extra ui python -m ui.harness`, then open http://127.0.0.1:8501.
+3. Launch `healthcare-claims` / `CHG-H001` from fixtures.
+4. Watch the node rows fill in, the parallel agents, and the provisional fragments.
+5. Inspect the decision: PASS for `CHG-H001`. Try `CHG-H003` for BLOCK with policy overrides, or `CHG-H004` for REVIEW.
+6. Tick "Require human approval", launch, then approve or reject with a reviewer name. Check the audit status.
+7. Open the Evaluation tab and run the fixture suite: 8 fixtures, all matching their labels.
+
+If port 8000 or 8501 is taken, pass `--port` to either command and set `SENTINELFLOW_API_URL` to match.
+
+**What needs real credentials.** With `python -m app.api.serve`, analyses call the configured providers: `GEMINI_API_KEY`, plus `OPENROUTER_API_KEY` for `vendor/model` ids. Retrieval needs pgvector from `compose.yaml`. `github` sources need the server's GitHub configuration and token. Without them, launch shows `PROVIDER_NOT_CONFIGURED` or `CHANGE_SOURCE_NOT_CONFIGURED`. The evaluation tab never needs credentials. For what live structured-output streaming (`API_STREAM_TOKENS=true`) has and has not been checked against, see "Live verification" above.

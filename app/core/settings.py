@@ -92,7 +92,62 @@ class Settings(BaseSettings):
     analysis_max_parallel_agents: int = Field(default=4, ge=1, le=4)
     analysis_node_timeout_seconds: float = Field(default=120.0, ge=10.0)
 
-    @field_validator("domains_root", "embedding_cache_path", "graph_checkpoint_path", mode="before")
+    # M5 — local HTTP harness (ADR-0003). Not a public service.
+    api_job_db_path: Path = Field(
+        default_factory=lambda: Path(".sentinelflow/api_jobs.sqlite"),
+        description="SQLite job metadata, idempotency keys and lifecycle events (gitignored)",
+    )
+    api_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "When set, /v1 requires 'Authorization: Bearer <key>' from any client. "
+            "When unset, /v1 accepts loopback clients only."
+        ),
+    )
+    api_max_active_jobs: int = Field(
+        default=8,
+        ge=1,
+        le=100,
+        description="Queued plus running jobs accepted at once; more are refused with 429",
+    )
+    api_max_concurrent_runs: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description="Jobs executing at once in this process; the rest wait in 'queued'",
+    )
+    api_max_body_bytes: int = Field(default=16_384, ge=1_024, le=1_048_576)
+    api_recover_jobs_on_startup: bool = True
+    api_gemini_rpm: int = Field(default=5, ge=1, description="Pacer for API-launched runs")
+
+    # M5-B — SSE progress stream (ADR-0003 "Streaming").
+    api_stream_tokens: bool = Field(
+        default=False,
+        description=(
+            "Forward live structured-output fragments (agent.token). Turning this on makes "
+            "the providers use their streaming APIs; unverified against live Gemini and "
+            "OpenRouter, so it is off by default. Node and lifecycle events always stream."
+        ),
+    )
+    api_stream_fragment_max_chars: int = Field(default=512, ge=16, le=8_192)
+    api_stream_max_fragments_per_run: int = Field(default=4_000, ge=1, le=100_000)
+    api_sse_keepalive_seconds: float = Field(default=15.0, gt=0, le=300)
+    api_sse_queue_size: int = Field(
+        default=256,
+        ge=4,
+        le=10_000,
+        description="Per-subscriber buffer; a client that falls this far behind loses live events",
+    )
+    api_sse_max_subscribers_per_job: int = Field(default=8, ge=1, le=100)
+    api_sse_retry_ms: int = Field(default=3_000, ge=100, le=60_000)
+
+    @field_validator(
+        "domains_root",
+        "embedding_cache_path",
+        "graph_checkpoint_path",
+        "api_job_db_path",
+        mode="before",
+    )
     @classmethod
     def resolve_repo_relative_path(cls, value: Path | str) -> Path:
         path = Path(value)

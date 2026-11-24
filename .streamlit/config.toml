@@ -1,0 +1,12 @@
+# Used by `streamlit run ui/streamlit_app.py` from the repository root.
+# `python -m ui.harness` passes the same settings as flags.
+[server]
+address = "127.0.0.1"
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = "none"
+toolbarMode = "minimal"
