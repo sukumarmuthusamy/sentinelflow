@@ -527,3 +527,20 @@ Tests: `tests/ui/` (HTTP client on a real socket, session model, HTTP-only bound
   - `latest_event_id` is now on the error-detail allowlist, so a future-cursor 422 carries it as ADR-0003 already documented.
 
 Tests: `tests/ui/test_key_transport.py`; `tests/api/test_events_stream.py::test_future_cursor_on_an_active_job_is_refused`.
+
+## M5 live streaming smoke test: what two providers actually sent
+
+**What looked wrong.** Token streaming had only been tested with fake streaming models. One live run was made to check it against real providers: one synthetic fixture, free-tier routes, retrieval off, and a hard cap on provider requests. It showed the two providers behave differently.
+
+**Investigation.**
+
+- *Gemini (triage).* The request went to `streamGenerateContent`. Its structured JSON arrived in several chunks, all before `node.completed`, each tagged with the right task and agent. The provider reported usage.
+- *OpenRouter (agent).* The request streamed and returned 200 at once, but nothing visible arrived for about 20 seconds. The structured answer then came as one burst, which the server cut into fragments at `API_STREAM_FRAGMENT_MAX_CHARS`. The streamed JSON matched the checkpointed result exactly.
+- *Usage.* The OpenRouter stream ended with no usage metadata even with `stream_usage=True`, so `account_usage` charged its conservative estimate instead of zero. The estimate is visible only in the server log, not in the trace returned by the API.
+
+**Root cause.** Streaming behaviour depends on the provider and the model. A model that reasons before answering, behind an OpenAI-compatible route, can stream its connection without streaming its answer. Usage reporting on streamed responses also varies by route.
+
+**Decision.**
+
+- Token streaming stays opt-in and off by default, documented as verified incremental on Gemini and burst-only on the OpenRouter model tested.
+- The estimate fallback (hardening M4) did its job; nothing was changed in code. Tracing whether the missing usage comes from the route or from the client's aggregation would need more live calls, so it is left as a follow-up, as is reporting estimated usage to API clients.

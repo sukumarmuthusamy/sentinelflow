@@ -11,7 +11,7 @@ SentinelFlow ingests a proposed software change and produces an **evidence-cited
 | **M2** | Complete | `sentinelflow-context` MCP server (7 tools, 3 resources), typed client adapter, read-only GitHub PR change source behind the same tools |
 | **M3** | Complete | Hybrid RAG, pgvector + Qdrant adapters, Gemini embeddings, reranker ablation (none vs Voyage), eval harness |
 | **M4** | Complete (merged in #1) | LangGraph workflow, five agents, triage planner, checkpoint + approval interrupt. A post-hardening live check ran on an OpenRouter stand-in model across 4 fixtures: both expected BLOCKs held, the 2 expected PASS fixtures returned REVIEW, and 0 invalid citations survived. Evidence coverage was 0% on the templated corpus. The primary Gemini model is not yet evaluated |
-| **M5** | Built on branch, final review pending | M5-A: versioned HTTP API with durable jobs, `Idempotency-Key`, approval resume over HTTP, an evaluation trigger and machine-readable errors. M5-B: SSE progress stream with durable node events, `Last-Event-ID` replay and opt-in live structured-output fragments. M5-C: Streamlit harness that drives all of it over HTTP only. Live provider streaming is not yet verified |
+| **M5** | Complete on branch, in review | M5-A: versioned HTTP API with durable jobs, `Idempotency-Key`, approval resume over HTTP, an evaluation trigger and machine-readable errors. M5-B: SSE progress stream with durable node events, `Last-Event-ID` replay and opt-in live structured-output fragments. M5-C: Streamlit harness that drives all of it over HTTP only. Token streaming is opt-in; a live smoke test saw incremental fragments from Gemini and one-burst delivery from OpenRouter |
 
 Canonical architecture and roadmap: [SENTINELFLOW_PLAN.md](SENTINELFLOW_PLAN.md).  
 Real obstacles and tradeoffs from M0–M5: [docs/ENGINEERING_JOURNAL.md](docs/ENGINEERING_JOURNAL.md).
@@ -372,7 +372,15 @@ curl -s localhost:8000/v1/evaluations/<job_id>/result
   - `agent.token`: provisional, unverified JSON fragments of an agent's structured output;
   - `stream.gap`: this client fell behind and lost live events.
 - **Stream lifetime.** The stream stays open while the job waits for approval, with keepalive comments, and ends after `job.completed` or `job.failed`. Disconnecting never affects the job.
-- **Token streaming is opt-in** (`API_STREAM_TOKENS=true`). It makes providers use their streaming APIs, which have not been verified live. Node and lifecycle events always stream.
+- **Token streaming is opt-in** (`API_STREAM_TOKENS=true`) and off by default. It makes providers use their streaming APIs. Node and lifecycle events always stream.
+
+**Live verification.** A controlled smoke test ran one synthetic fixture analysis through the HTTP analysis and SSE endpoints, with token streaming on, Gemini Flash Lite for triage and a free OpenRouter model for the agents. Retrieval was disabled.
+
+- **Gemini:** produced incremental structured-output fragments before its node completed.
+- **OpenRouter:** completed structured-output streaming, but delivered the answer as one burst. Its stream carried no usage metadata, so the conservative token estimate was charged.
+- **Not covered:** the full RAG pipeline, embeddings, live approval and resume, and concurrent live agent streams.
+
+This is separate from the complete offline HTTP demo (M5-C below) and from the full RAG evaluation, which is deferred to M6.
 
 ```bash
 curl -N localhost:8000/v1/analyses/<job_id>/events
@@ -423,4 +431,4 @@ The key can also be typed into the sidebar's password field; it stays in that br
 
 If port 8000 or 8501 is taken, pass `--port` to either command and set `SENTINELFLOW_API_URL` to match.
 
-**What needs real credentials.** With `python -m app.api.serve`, analyses call the configured providers: `GEMINI_API_KEY`, plus `OPENROUTER_API_KEY` for `vendor/model` ids. Retrieval needs pgvector from `compose.yaml`. `github` sources need the server's GitHub configuration and token. Without them, launch shows `PROVIDER_NOT_CONFIGURED` or `CHANGE_SOURCE_NOT_CONFIGURED`. The evaluation tab never needs credentials. Live structured-output streaming (`API_STREAM_TOKENS=true`) has not been verified against Gemini or OpenRouter.
+**What needs real credentials.** With `python -m app.api.serve`, analyses call the configured providers: `GEMINI_API_KEY`, plus `OPENROUTER_API_KEY` for `vendor/model` ids. Retrieval needs pgvector from `compose.yaml`. `github` sources need the server's GitHub configuration and token. Without them, launch shows `PROVIDER_NOT_CONFIGURED` or `CHANGE_SOURCE_NOT_CONFIGURED`. The evaluation tab never needs credentials. For what live structured-output streaming (`API_STREAM_TOKENS=true`) has and has not been checked against, see "Live verification" above.

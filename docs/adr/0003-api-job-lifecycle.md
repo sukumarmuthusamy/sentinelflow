@@ -158,7 +158,12 @@ Node inputs, errors and interrupt payloads are dropped in translation, so nothin
 - **Bounded:** at most `API_STREAM_MAX_FRAGMENTS_PER_RUN` per run. Further fragments are counted in `fragments_dropped`.
 - **Opt-in:** off unless `API_STREAM_TOKENS=true`. `messages` mode attaches a streaming callback handler, and LangChain then calls the provider's *streaming* API (`BaseChatModel._should_stream`). That changes the HTTP call live providers receive.
   - `langchain-openai` omits usage from streams when `base_url` is custom, which would zero OpenRouter token budgets. The OpenRouter client therefore sets `stream_usage=True`, which affects only streamed calls.
-  - Neither Gemini nor OpenRouter structured-output streaming has been run live. Node and lifecycle events stream regardless of this setting.
+  - **Provider verification.** One live smoke test covered one synthetic fixture over HTTP and SSE, with retrieval disabled:
+    - Gemini Flash Lite (triage) streamed incremental structured-output fragments before its node completed.
+    - A free OpenRouter model (agents) completed structured-output streaming with no errors, but its answer arrived as one burst at the end of the stream.
+    - The OpenRouter stream carried no usage metadata despite `stream_usage=True`, so the conservative estimate was charged.
+  - **Not verified live:** retrieval and embeddings, the verifier call, concurrent agent streams, and approval and resume.
+  - The setting stays off by default. Node and lifecycle events stream regardless of it.
 
 **Not covered.**
 
